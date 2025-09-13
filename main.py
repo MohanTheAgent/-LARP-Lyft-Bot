@@ -16,12 +16,12 @@ load_dotenv()
 # CONFIG
 # -----------------------------
 GUILD_ID = 1416057930381262880
-TARGET_CHANNEL_ID = 1416334665958166560
-ROLE_ID_1 = 1416068902609223749
-ROLE_ID_2 = 1416063969965248594
-LOG_CHANNEL_ID = 1416342987893375007
-AUDIT_LOG_CHANNEL_ID = 1416392593222270976
-ADMIN_ROLE_ID = 1416069791495622707  # for /profile_admin
+TARGET_CHANNEL_ID = 1416334665958166560        # where ride requests are posted
+ROLE_ID_1 = 1416068902609223749                # driver role 1 (can claim, log, search)
+ROLE_ID_2 = 1416063969965248594                # driver role 2 (can claim, log, search)
+LOG_CHANNEL_ID = 1416342987893375007           # ride logs channel (for /log-ride)
+AUDIT_LOG_CHANNEL_ID = 1416392593222270976     # everything the bot does gets logged here
+ADMIN_ROLE_ID = 1416069791495622707            # /profile_admin only
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
@@ -43,6 +43,7 @@ def today_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 async def load_db():
+    """Load or initialize data.json"""
     global _db
     async with _db_lock:
         if not os.path.exists(DATA_FILE):
@@ -58,6 +59,7 @@ async def load_db():
             _db = {"riders": {}, "drivers": {}}
 
 async def save_db():
+    """Atomic write to data.json"""
     async with _db_lock:
         tmp = DATA_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -90,6 +92,7 @@ def avg(values: List[float]) -> Optional[float]:
     return (sum(vals) / len(vals)) if vals else None
 
 async def audit_log(text: str):
+    """Log any action to the dedicated audit channel."""
     ch = bot.get_channel(AUDIT_LOG_CHANNEL_ID)
     if isinstance(ch, discord.TextChannel):
         try:
@@ -98,11 +101,11 @@ async def audit_log(text: str):
             pass
 
 # -----------------------------
-# Rating buttons (DM)
+# Rating buttons (DM after End Ride)
 # -----------------------------
 class RatingView(discord.ui.View):
     def __init__(self, driver_id: int, from_user_id: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=300)  # 5 minutes
         self.driver_id = driver_id
         self.from_user_id = from_user_id
 
@@ -112,28 +115,29 @@ class RatingView(discord.ui.View):
             drec = drivers.setdefault(str(self.driver_id), {"name": "", "ratings": [], "admin_notes": [], "flag": None})
             drec["ratings"].append({"from": self.from_user_id, "rating": int(value), "date": today_iso()})
         await save_db()
+        # Disable buttons and thank them
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(content="Thank you for your feedback!", view=self)
         await audit_log(f"Rating submitted: user {self.from_user_id} rated driver {self.driver_id} = {value}")
 
-    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary, custom_id="rate_1")
     async def r1(self, i: discord.Interaction, b: discord.ui.Button): await self._record(i, 1)
 
-    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary, custom_id="rate_2")
     async def r2(self, i: discord.Interaction, b: discord.ui.Button): await self._record(i, 2)
 
-    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, custom_id="rate_3")
     async def r3(self, i: discord.Interaction, b: discord.ui.Button): await self._record(i, 3)
 
-    @discord.ui.button(label="4", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="4", style=discord.ButtonStyle.secondary, custom_id="rate_4")
     async def r4(self, i: discord.Interaction, b: discord.ui.Button): await self._record(i, 4)
 
-    @discord.ui.button(label="5", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="5", style=discord.ButtonStyle.primary, custom_id="rate_5")
     async def r5(self, i: discord.Interaction, b: discord.ui.Button): await self._record(i, 5)
 
 # -----------------------------
-# Claim/End view
+# Claim / End view
 # -----------------------------
 class ClaimView(discord.ui.View):
     def __init__(self, requester_id: int):
@@ -191,7 +195,7 @@ class ClaimView(discord.ui.View):
 
         button.disabled = True
 
-        # Update message embed
+        # Update embed to show ended state
         msg = interaction.message
         embed = None
         if msg.embeds:
@@ -208,12 +212,13 @@ class ClaimView(discord.ui.View):
             embed = new
         await interaction.followup.edit_message(message_id=msg.id, embed=embed, view=self)
 
+        # Announce in channel
         ch = bot.get_channel(TARGET_CHANNEL_ID)
         if isinstance(ch, discord.TextChannel):
             await ch.send(f"-# Ride ended by {interaction.user.mention}")
         await audit_log(f"Ride ended by driver {interaction.user.id} for requester {self.requester_id}")
 
-        # DM the requester for rating (embed + buttons)
+        # DM the requester for rating (embed + 1–5 buttons)
         try:
             user = bot.get_user(self.requester_id) or await bot.fetch_user(self.requester_id)
             if user:
@@ -281,6 +286,7 @@ async def request_ride(
     content = f"<@&{ROLE_ID_1}> <@&{ROLE_ID_2}>"
     msg = await ch.send(content=content, embed=e, view=view, allowed_mentions=discord.AllowedMentions(roles=True))
 
+    # Optional: create a thread for ride discussion
     try:
         t = await msg.create_thread(name=f"Ride - {interaction.user.display_name}", auto_archive_duration=1440)
         await t.send(f"{interaction.user.mention} Use this thread to coordinate your ride.")
@@ -336,6 +342,7 @@ async def log_ride(
         })
     await save_db()
 
+    # Post a compact embed to the ride log channel
     e = discord.Embed(title="Ride Logged", color=discord.Color.dark_grey(), timestamp=datetime.now(timezone.utc))
     e.add_field(name="Rider", value=f"{rider.mention} ({rider.id})", inline=False)
     e.add_field(name="Ride Link", value=ride_link, inline=False)
@@ -374,7 +381,6 @@ async def search_cmd(interaction: discord.Interaction, user: discord.User):
 
     embed = discord.Embed(
         title=f"Member Profile",
-        description="Summary view",
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc)
     )
@@ -383,13 +389,13 @@ async def search_cmd(interaction: discord.Interaction, user: discord.User):
     # Rider section
     if rrec and rrec.get("rides"):
         rides = rrec["rides"]
-        r_avg_vals: List[float] = []
+        rider_ratings: List[float] = []
         for r in rides:
             try:
-                r_avg_vals.append(float(r["rating"]))
+                rider_ratings.append(float(r["rating"]))
             except Exception:
                 pass
-        rider_avg = avg(r_avg_vals)
+        rider_avg = avg(rider_ratings)
         embed.add_field(
             name="Rider Rides",
             value=f"Total: {len(rides)} | Avg: {(f'{rider_avg:.2f}' if rider_avg is not None else '-')}",
@@ -400,36 +406,32 @@ async def search_cmd(interaction: discord.Interaction, user: discord.User):
     else:
         embed.add_field(name="Rider Rides", value="No history", inline=False)
 
-    # Driver section (only if any ratings exist)
+    # Driver section only if ratings exist
     if drec and drec.get("ratings"):
         ratings = [int(x["rating"]) for x in drec["ratings"] if isinstance(x.get("rating"), int)]
-        d_avg = avg(ratings)
-        embed.add_field(name="Driver Rating", value=f"Average: {d_avg:.2f} from {len(ratings)} ratings", inline=False)
+        if ratings:
+            d_avg = avg(ratings)
+            embed.add_field(name="Driver Rating", value=f"Average: {d_avg:.2f} from {len(ratings)} ratings", inline=False)
 
     embed.set_thumbnail(url=user.display_avatar.url)
-
     await interaction.followup.send(embed=embed, ephemeral=True)
     await audit_log(f"Search run by {interaction.user.id} for {user.id}")
 
 # -----------------------------
-# /profile_admin (optional tools)
+# /profile_admin (admin-only)
 # -----------------------------
 profile_admin = app_commands.Group(name="profile_admin", description="Admin tools")
 
-def admin_guard(func):
-    async def wrapper(interaction: discord.Interaction, *args, **kwargs):
-        if interaction.guild_id != GUILD_ID:
-            return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
-        if not user_is_admin(interaction.user):
-            return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
-        return await func(interaction, *args, **kwargs)
-    return wrapper
-
 @profile_admin.command(name="set_flag", description="Set a short flag on a rider or driver profile")
 @app_commands.describe(user="Member", target="rider or driver", flag="Short label")
-@app_commands.choices(target=[app_commands.Choice(name="rider", value="rider"), app_commands.Choice(name="driver", value="driver")])
-@admin_guard
+@app_commands.choices(target=[app_commands.Choice(name="rider", value="rider"),
+                              app_commands.Choice(name="driver", value="driver")])
 async def pa_set_flag(interaction: discord.Interaction, user: discord.User, target: app_commands.Choice[str], flag: str):
+    if interaction.guild_id != GUILD_ID:
+        return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message("You are not authorized.", ephemeral=True)
+
     await interaction.response.defer(ephemeral=True)
     async with _db_lock:
         if target.value == "rider":
@@ -444,9 +446,14 @@ async def pa_set_flag(interaction: discord.Interaction, user: discord.User, targ
 
 @profile_admin.command(name="clear_flag", description="Clear flag on a rider or driver profile")
 @app_commands.describe(user="Member", target="rider or driver")
-@app_commands.choices(target=[app_commands.Choice(name="rider", value="rider"), app_commands.Choice(name="driver", value="driver")])
-@admin_guard
+@app_commands.choices(target=[app_commands.Choice(name="rider", value="rider"),
+                              app_commands.Choice(name="driver", value="driver")])
 async def pa_clear_flag(interaction: discord.Interaction, user: discord.User, target: app_commands.Choice[str]):
+    if interaction.guild_id != GUILD_ID:
+        return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message("You are not authorized.", ephemeral=True)
+
     await interaction.response.defer(ephemeral=True)
     async with _db_lock:
         if target.value == "rider":
@@ -460,7 +467,7 @@ async def pa_clear_flag(interaction: discord.Interaction, user: discord.User, ta
     await audit_log(f"Admin {interaction.user.id} cleared flag on {user.id} {target.value}")
 
 # -----------------------------
-# Ready/sync
+# Ready / sync
 # -----------------------------
 @bot.event
 async def on_ready():
