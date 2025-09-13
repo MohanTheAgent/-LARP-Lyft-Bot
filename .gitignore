@@ -1,0 +1,13 @@
+# Environment variables
+.env
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Build artifacts
+*.egg
+*.egg-info/
+dist/
+build/
