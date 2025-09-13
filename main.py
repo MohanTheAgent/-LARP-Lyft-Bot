@@ -19,8 +19,8 @@ GUILD_ID = 1416057930381262880
 TARGET_CHANNEL_ID = 1416334665958166560        # ride request posts
 ROLE_ID_1 = 1416068902609223749                # driver role 1
 ROLE_ID_2 = 1416063969965248594                # driver role 2
-LOG_CHANNEL_ID = 1416342987893375007           # ride logs (/log-ride)
-AUDIT_LOG_CHANNEL_ID = 1416392593222270976     # audit / activity log
+AUDIT_LOG_CHANNEL_ID = 1416392593222270976     # all logs here
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
 
@@ -153,44 +153,25 @@ class RatingView(discord.ui.View):
         )
 
     @discord.ui.button(label="1", style=discord.ButtonStyle.secondary, custom_id="rate_1")
-    async def r1(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 1)
-
+    async def r1(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 1)
     @discord.ui.button(label="2", style=discord.ButtonStyle.secondary, custom_id="rate_2")
-    async def r2(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 2)
-
+    async def r2(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 2)
     @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, custom_id="rate_3")
-    async def r3(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 3)
-
+    async def r3(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 3)
     @discord.ui.button(label="4", style=discord.ButtonStyle.secondary, custom_id="rate_4")
-    async def r4(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 4)
-
+    async def r4(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 4)
     @discord.ui.button(label="5", style=discord.ButtonStyle.secondary, custom_id="rate_5")
-    async def r5(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 5)
-
+    async def r5(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 5)
     @discord.ui.button(label="6", style=discord.ButtonStyle.secondary, custom_id="rate_6")
-    async def r6(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 6)
-
+    async def r6(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 6)
     @discord.ui.button(label="7", style=discord.ButtonStyle.secondary, custom_id="rate_7")
-    async def r7(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 7)
-
+    async def r7(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 7)
     @discord.ui.button(label="8", style=discord.ButtonStyle.secondary, custom_id="rate_8")
-    async def r8(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 8)
-
+    async def r8(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 8)
     @discord.ui.button(label="9", style=discord.ButtonStyle.secondary, custom_id="rate_9")
-    async def r9(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 9)
-
+    async def r9(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 9)
     @discord.ui.button(label="10", style=discord.ButtonStyle.primary, custom_id="rate_10")
-    async def r10(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 10)
+    async def r10(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 10)
 
 # -----------------------------
 # Claim / End view (stores thread_id to post rating there)
@@ -226,7 +207,6 @@ class ClaimView(discord.ui.View):
                     color=base.color,
                     timestamp=datetime.now(timezone.utc)
                 )
-                # Copy/replace fields, inject Status + Driver
                 has_status = False
                 for f in base.fields:
                     name_lower = f.name.strip().lower()
@@ -293,7 +273,6 @@ class ClaimView(discord.ui.View):
                     new.add_field(name=f.name, value=f.value, inline=f.inline)
             if not has_status:
                 new.add_field(name="Status", value="Completed", inline=True)
-
             new.set_footer(text="Ride ended")
             embed = new
         await interaction.followup.edit_message(message_id=msg.id, embed=embed, view=self)
@@ -313,7 +292,7 @@ class ClaimView(discord.ui.View):
             thumbnail_url=getattr(interaction.user.display_avatar, "url", discord.Embed.Empty),
         )
 
-        # Rating UI + comment prompt in ride thread
+        # Rating UI + comment prompt in ride thread (ping rider with 1–10 buttons)
         if self.thread_id:
             thread = bot.get_channel(self.thread_id)
             if isinstance(thread, discord.Thread):
@@ -353,7 +332,7 @@ class ClaimView(discord.ui.View):
                     )
 
 # -----------------------------
-# /request ride  (adds Status field; rating 1–10 later)
+# /request ride  (adds Status field; separator line)
 # -----------------------------
 request_group = app_commands.Group(name="request", description="Create ride requests")
 
@@ -435,7 +414,7 @@ async def request_ride(
     )
 
 # -----------------------------
-# /log-ride  (driver-side numeric rating 1–10 for the ride)
+# /log-ride (store to JSON + log to AUDIT channel only)
 # -----------------------------
 @tree.command(name="log-ride", description="Log a completed ride")
 @app_commands.describe(
@@ -480,114 +459,24 @@ async def log_ride(
         })
     await save_db()
 
-    e = discord.Embed(title="Ride Logged", color=discord.Color.dark_grey(), timestamp=datetime.now(timezone.utc))
-    e.add_field(name="Rider", value=named(rider), inline=False)
-    e.add_field(name="Ride Link", value=ride_link, inline=False)
-    e.add_field(
-        name="Income",
-        value=(f"${income_val:,.2f}" if isinstance(income_val, (int, float)) else str(income)),
-        inline=True,
-    )
-    e.add_field(
-        name="Driver's Rating (1–10)",
-        value=(f"{rating_val:.1f}" if isinstance(rating_val, (int, float)) else str(rating)),
-        inline=True,
-    )
-    e.add_field(
-        name="Rides This Week",
-        value=(str(rides_val) if rides_val is not None else rides_this_week),
-        inline=True,
-    )
-    if comment:
-        e.add_field(name="Comment", value=comment[:1024], inline=False)
-    e.add_field(name="Driver", value=named(interaction.user), inline=True)
-    e.set_thumbnail(url=rider.display_avatar.url)
-
-    log_ch = bot.get_channel(LOG_CHANNEL_ID)
-    if isinstance(log_ch, discord.TextChannel):
-        await log_ch.send(embed=e)
-
-    await interaction.edit_original_response(content="Ride logged.")
+    # Log in the audit channel (no separate public log channel)
     await send_audit_embed(
-        "Ride Logged (Internal)",
+        "Ride Logged",
         fields=[
             ("Rider", named(rider), True),
             ("Driver", named(interaction.user), True),
-            ("Income", e.fields[2].value, True),
-            ("Driver Rating", e.fields[3].value, True),
+            ("Ride Link", ride_link, False),
+            ("Income", f"${income_val:,.2f}" if isinstance(income_val, (int, float)) else str(income), True),
+            ("Driver Rating (1–10)", f"{rating_val:.1f}" if isinstance(rating_val, (int, float)) else str(rating), True),
+            ("Rides This Week", str(rides_val) if rides_val is not None else rides_this_week, True),
+            ("Comment", comment[:1024] if comment else "-", False),
             ("Date", today_iso(), True),
         ],
         color=discord.Color.dark_grey(),
         thumbnail_url=getattr(rider.display_avatar, "url", discord.Embed.Empty),
     )
 
-# -----------------------------
-# /search (with ephemeral toggle)
-# -----------------------------
-@tree.command(name="search", description="Search a user's rider/driver profile")
-@app_commands.describe(
-    user="User to search",
-    ephemeral="If true, only you see the result (default: true)"
-)
-async def search_cmd(interaction: discord.Interaction, user: discord.User, ephemeral: Optional[bool] = True):
-    await interaction.response.defer(ephemeral=bool(ephemeral))
-    if interaction.guild_id != GUILD_ID:
-        return await interaction.followup.send("This command is not available in this server.", ephemeral=True)
-    if not user_has_allowed_role(interaction.user):
-        return await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
-
-    async with _db_lock:
-        riders = _db.get("riders", {})
-        drivers = _db.get("drivers", {})
-        rrec = riders.get(str(user.id))
-        drec = drivers.get(str(user.id))
-
-    emb = discord.Embed(
-        title="Member Profile",
-        color=discord.Color.blurple(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    emb.add_field(name="User", value=named(user), inline=False)
-
-    if rrec and rrec.get("rides"):
-        rides = rrec["rides"]
-        rider_ratings: List[float] = []
-        for r in rides:
-            try:
-                rider_ratings.append(float(r["rating"]))
-            except Exception:
-                pass
-        rider_avg = avg(rider_ratings)
-        emb.add_field(
-            name="Rider Rides",
-            value=f"Total: {len(rides)} | Avg: {(f'{rider_avg:.2f}' if rider_avg is not None else '-')}",
-            inline=False
-        )
-        comments = [f"- {x['date']}: {x['comment']}" for x in rides if x.get("comment")] or ["-"]
-        emb.add_field(name="Recent Rider Comments", value="\n".join(comments[:5]), inline=False)
-    else:
-        emb.add_field(name="Rider Rides", value="No history", inline=False)
-
-    if drec and drec.get("ratings"):
-        ratings = [int(x["rating"]) for x in drec["ratings"] if isinstance(x.get("rating"), int)]
-        if ratings:
-            d_avg = avg(ratings)
-            emb.add_field(name="Driver Ratings", value=f"{len(ratings)} | Avg {d_avg:.2f} (1–10)", inline=False)
-
-    emb.set_thumbnail(url=user.display_avatar.url)
-    await interaction.followup.send(embed=emb, ephemeral=bool(ephemeral))
-
-    await send_audit_embed(
-        "Profile Searched",
-        fields=[
-            ("Queried", named(user), True),
-            ("By", named(interaction.user), True),
-            ("Ephemeral", str(bool(ephemeral)), True),
-            ("Date", today_iso(), True),
-        ],
-        color=discord.Color.teal(),
-        thumbnail_url=getattr(user.display_avatar, "url", discord.Embed.Empty),
-    )
+    await interaction.edit_original_response(content="Ride logged.")
 
 # -----------------------------
 # Ready / sync
