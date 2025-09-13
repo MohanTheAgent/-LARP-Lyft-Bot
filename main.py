@@ -19,7 +19,7 @@ GUILD_ID = 1416057930381262880
 TARGET_CHANNEL_ID = 1416334665958166560        # where ride requests are posted
 ROLE_ID_1 = 1416068902609223749                # driver role 1 (can claim, log, search)
 ROLE_ID_2 = 1416063969965248594                # driver role 2 (can claim, log, search)
-LOG_CHANNEL_ID = 1416342987893375007           # ride logs channel (for /log-ride)
+LOG_CHANNEL_ID = 1416342987893375007           # ride logs channel (/log-ride)
 AUDIT_LOG_CHANNEL_ID = 1416392593222270976     # everything the bot does gets logged here
 ADMIN_ROLE_ID = 1416069791495622707            # /profile_admin only
 
@@ -101,7 +101,8 @@ async def audit_log(text: str):
             pass
 
 # -----------------------------
-# Rating buttons (DM after End Ride)
+# Rating buttons (DM/thread after End Ride)
+# Restricted: only the rider (from_user_id) can press
 # -----------------------------
 class RatingView(discord.ui.View):
     def __init__(self, driver_id: int, from_user_id: int):
@@ -110,15 +111,32 @@ class RatingView(discord.ui.View):
         self.from_user_id = from_user_id
 
     async def _record(self, interaction: discord.Interaction, value: int):
+        # Restrict to the rider only
+        if interaction.user.id != self.from_user_id:
+            return await interaction.response.send_message(
+                "Only the rider who requested this ride can submit a rating.", ephemeral=True
+            )
+
         async with _db_lock:
             drivers = _db.setdefault("drivers", {})
             drec = drivers.setdefault(str(self.driver_id), {"name": "", "ratings": [], "admin_notes": [], "flag": None})
             drec["ratings"].append({"from": self.from_user_id, "rating": int(value), "date": today_iso()})
         await save_db()
+
         # Disable buttons and thank them
         for item in self.children:
             item.disabled = True
-        await interaction.response.edit_message(content="Thank you for your feedback!", view=self)
+        try:
+            # If this came from a message with components, edit it
+            await interaction.response.edit_message(content="Thank you for your feedback!", view=self)
+        except discord.InteractionResponded:
+            await interaction.followup.edit_message(interaction.message.id, content="Thank you for your feedback!", view=self)
+        except Exception:
+            try:
+                await interaction.followup.send("Thank you for your feedback!", ephemeral=True)
+            except Exception:
+                pass
+
         await audit_log(f"Rating submitted: user {self.from_user_id} rated driver {self.driver_id} = {value}")
 
     @discord.ui.button(label="1", style=discord.ButtonStyle.secondary, custom_id="rate_1")
@@ -137,12 +155,13 @@ class RatingView(discord.ui.View):
     async def r5(self, i: discord.Interaction, b: discord.ui.Button): await self._record(i, 5)
 
 # -----------------------------
-# Claim / End view
+# Claim / End view (stores thread_id so we can post rating form there)
 # -----------------------------
 class ClaimView(discord.ui.View):
-    def __init__(self, requester_id: int):
+    def __init__(self, requester_id: int, thread_id: Optional[int] = None):
         super().__init__(timeout=None)
         self.requester_id = requester_id
+        self.thread_id = thread_id  # ride thread to post rating form
         self.claimed_by: Optional[int] = None
         self._lock = asyncio.Lock()
 
@@ -218,23 +237,46 @@ class ClaimView(discord.ui.View):
             await ch.send(f"-# Ride ended by {interaction.user.mention}")
         await audit_log(f"Ride ended by driver {interaction.user.id} for requester {self.requester_id}")
 
-        # DM the requester for rating (embed + 1–5 buttons)
-        try:
-            user = bot.get_user(self.requester_id) or await bot.fetch_user(self.requester_id)
-            if user:
-                rating_embed = discord.Embed(
-                    title="Rate Your Driver",
-                    description="How was your ride? Please choose a rating from 1 to 5.",
-                    color=discord.Color.blurple()
-                )
-                view = RatingView(driver_id=self.claimed_by, from_user_id=self.requester_id)
-                await user.send(embed=rating_embed, view=view)
-                await audit_log(f"Sent rating DM to {self.requester_id} for driver {self.claimed_by}")
-        except discord.Forbidden:
-            await interaction.followup.send("Could not DM the rider for rating (DMs may be closed).", ephemeral=True)
-            await audit_log(f"Failed to DM rider {self.requester_id} for rating (Forbidden)")
-        except Exception as e:
-            await audit_log(f"Failed to DM rider {self.requester_id} for rating: {e}")
+        # Post rating UI in the ride thread (preferred)
+        posted_in_thread = False
+        if self.thread_id:
+            thread = bot.get_channel(self.thread_id)
+            if isinstance(thread, discord.Thread):
+                try:
+                    rating_embed = discord.Embed(
+                        title="Rate Your Driver",
+                        description="How was your ride? Please choose a rating from 1 to 5.",
+                        color=discord.Color.blurple()
+                    )
+                    await thread.send(
+                        content=f"<@{self.requester_id}>",
+                        embed=rating_embed,
+                        view=RatingView(driver_id=self.claimed_by, from_user_id=self.requester_id),
+                        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False)
+                    )
+                    posted_in_thread = True
+                    await audit_log(f"Posted rating form in thread {self.thread_id} for rider {self.requester_id}")
+                except Exception as e:
+                    await audit_log(f"Failed posting rating form in thread {self.thread_id}: {e}")
+
+        # Fallback: DM the rider if thread missing/unavailable
+        if not posted_in_thread:
+            try:
+                user = bot.get_user(self.requester_id) or await bot.fetch_user(self.requester_id)
+                if user:
+                    rating_embed = discord.Embed(
+                        title="Rate Your Driver",
+                        description="How was your ride? Please choose a rating from 1 to 5.",
+                        color=discord.Color.blurple()
+                    )
+                    view = RatingView(driver_id=self.claimed_by, from_user_id=self.requester_id)
+                    await user.send(embed=rating_embed, view=view)
+                    await audit_log(f"Sent rating DM to {self.requester_id} for driver {self.claimed_by}")
+            except discord.Forbidden:
+                await interaction.followup.send("Could not DM the rider for rating (DMs may be closed).", ephemeral=True)
+                await audit_log(f"Failed to DM rider {self.requester_id} for rating (Forbidden)")
+            except Exception as e:
+                await audit_log(f"Failed to DM rider {self.requester_id} for rating: {e}")
 
 # -----------------------------
 # /request ride
@@ -274,7 +316,8 @@ async def request_ride(
     e.set_thumbnail(url=interaction.user.display_avatar.url)
     e.set_footer(text="Click Claim to accept this ride")
 
-    view = ClaimView(requester_id=interaction.user.id)
+    # Prepare view (thread_id will be set right after we create the thread)
+    view = ClaimView(requester_id=interaction.user.id, thread_id=None)
 
     ch = bot.get_channel(TARGET_CHANNEL_ID)
     if ch is None:
@@ -286,9 +329,10 @@ async def request_ride(
     content = f"<@&{ROLE_ID_1}> <@&{ROLE_ID_2}>"
     msg = await ch.send(content=content, embed=e, view=view, allowed_mentions=discord.AllowedMentions(roles=True))
 
-    # Optional: create a thread for ride discussion
+    # Create a thread for the ride; store thread_id on the view so End Ride can post rating there
     try:
         t = await msg.create_thread(name=f"Ride - {interaction.user.display_name}", auto_archive_duration=1440)
+        view.thread_id = t.id
         await t.send(f"{interaction.user.mention} Use this thread to coordinate your ride.")
     except Exception:
         pass
