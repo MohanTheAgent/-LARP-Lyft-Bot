@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: rideshare-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 -u main.py
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
