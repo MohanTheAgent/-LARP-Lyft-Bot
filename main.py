@@ -20,7 +20,6 @@ TARGET_CHANNEL_ID = 1416334665958166560        # ride request posts
 ROLE_ID_1 = 1416068902609223749                # driver role 1
 ROLE_ID_2 = 1416063969965248594                # driver role 2
 AUDIT_LOG_CHANNEL_ID = 1416392593222270976     # all logs here
-
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
 
@@ -110,7 +109,7 @@ async def send_audit_embed(
         pass
 
 # -----------------------------
-# Rating buttons (1–10) — thread-based; only rider can press
+# Rating buttons (1–5) — thread-based; only rider can press
 # -----------------------------
 class RatingView(discord.ui.View):
     def __init__(self, driver_id: int, from_user_id: int):
@@ -146,32 +145,31 @@ class RatingView(discord.ui.View):
             fields=[
                 ("Driver", f"<@{self.driver_id}>", True),
                 ("From", f"<@{self.from_user_id}>", True),
-                ("Rating", f"{value}/10", True),
+                ("Rating", f"{value}/5", True),
                 ("Date", today_iso(), True),
             ],
             color=discord.Color.green(),
         )
 
-    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary, custom_id="rate_1")
-    async def r1(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 1)
-    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary, custom_id="rate_2")
-    async def r2(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 2)
-    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, custom_id="rate_3")
-    async def r3(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 3)
-    @discord.ui.button(label="4", style=discord.ButtonStyle.secondary, custom_id="rate_4")
-    async def r4(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 4)
-    @discord.ui.button(label="5", style=discord.ButtonStyle.secondary, custom_id="rate_5")
-    async def r5(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 5)
-    @discord.ui.button(label="6", style=discord.ButtonStyle.secondary, custom_id="rate_6")
-    async def r6(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 6)
-    @discord.ui.button(label="7", style=discord.ButtonStyle.secondary, custom_id="rate_7")
-    async def r7(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 7)
-    @discord.ui.button(label="8", style=discord.ButtonStyle.secondary, custom_id="rate_8")
-    async def r8(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 8)
-    @discord.ui.button(label="9", style=discord.ButtonStyle.secondary, custom_id="rate_9")
-    async def r9(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 9)
-    @discord.ui.button(label="10", style=discord.ButtonStyle.primary, custom_id="rate_10")
-    async def r10(self, interaction: discord.Interaction, _: discord.ui.Button): await self._record(interaction, 10)
+    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary, row=0, custom_id="rate_1")
+    async def r1(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._record(interaction, 1)
+
+    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary, row=0, custom_id="rate_2")
+    async def r2(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._record(interaction, 2)
+
+    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, row=0, custom_id="rate_3")
+    async def r3(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._record(interaction, 3)
+
+    @discord.ui.button(label="4", style=discord.ButtonStyle.secondary, row=0, custom_id="rate_4")
+    async def r4(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._record(interaction, 4)
+
+    @discord.ui.button(label="5", style=discord.ButtonStyle.primary, row=0, custom_id="rate_5")
+    async def r5(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._record(interaction, 5)
 
 # -----------------------------
 # Claim / End view (stores thread_id to post rating there)
@@ -292,14 +290,14 @@ class ClaimView(discord.ui.View):
             thumbnail_url=getattr(interaction.user.display_avatar, "url", discord.Embed.Empty),
         )
 
-        # Rating UI + comment prompt in ride thread (ping rider with 1–10 buttons)
+        # Rating UI + comment prompt in ride thread (ping rider with 1–5 buttons)
         if self.thread_id:
             thread = bot.get_channel(self.thread_id)
             if isinstance(thread, discord.Thread):
                 try:
                     rating_embed = discord.Embed(
                         title="Rate Your Driver",
-                        description="Please choose a rating from **1 to 10**.",
+                        description="Please choose a rating from 1 to 5.",
                         color=discord.Color.blurple()
                     )
                     await thread.send(
@@ -311,7 +309,7 @@ class ClaimView(discord.ui.View):
                     await thread.send(
                         embed=discord.Embed(
                             title="Driver Feedback",
-                            description="💬 Please reply in this thread with any comments about your driver.",
+                            description="Please reply in this thread with any comments about your driver.",
                             color=discord.Color.grayple()
                         )
                     )
@@ -332,7 +330,7 @@ class ClaimView(discord.ui.View):
                     )
 
 # -----------------------------
-# /request ride  (adds Status field; separator line)
+# /request ride (Status field; separator line)
 # -----------------------------
 request_group = app_commands.Group(name="request", description="Create ride requests")
 
@@ -421,7 +419,7 @@ async def request_ride(
     rider="Rider user",
     ride_link="Ride link or reference",
     income="Income for this ride (number)",
-    rating="Your rating for this ride (number 1–10)",
+    rating="Your rating for this ride (number 1–5)",
     rides_this_week="Number of rides you completed this week (number)",
     comment="Optional rider comment"
 )
@@ -459,7 +457,6 @@ async def log_ride(
         })
     await save_db()
 
-    # Log in the audit channel (no separate public log channel)
     await send_audit_embed(
         "Ride Logged",
         fields=[
@@ -467,7 +464,7 @@ async def log_ride(
             ("Driver", named(interaction.user), True),
             ("Ride Link", ride_link, False),
             ("Income", f"${income_val:,.2f}" if isinstance(income_val, (int, float)) else str(income), True),
-            ("Driver Rating (1–10)", f"{rating_val:.1f}" if isinstance(rating_val, (int, float)) else str(rating), True),
+            ("Driver Rating (1–5)", f"{rating_val:.1f}" if isinstance(rating_val, (int, float)) else str(rating), True),
             ("Rides This Week", str(rides_val) if rides_val is not None else rides_this_week, True),
             ("Comment", comment[:1024] if comment else "-", False),
             ("Date", today_iso(), True),
