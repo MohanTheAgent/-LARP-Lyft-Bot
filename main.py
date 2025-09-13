@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-import os, json, asyncio
+import os
+import json
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
@@ -19,8 +21,6 @@ ROLE_ID_1 = 1416068902609223749                # driver role 1
 ROLE_ID_2 = 1416063969965248594                # driver role 2
 LOG_CHANNEL_ID = 1416342987893375007           # ride logs (/log-ride)
 AUDIT_LOG_CHANNEL_ID = 1416392593222270976     # audit / activity log
-ADMIN_ROLE_ID = 1416069791495622707            # (kept for future use if needed)
-
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
 
@@ -125,7 +125,6 @@ class RatingView(discord.ui.View):
         async with _db_lock:
             drivers = _db.setdefault("drivers", {})
             drec = drivers.setdefault(str(self.driver_id), {"name": "", "ratings": []})
-            # attempt to store readable name
             try:
                 u = interaction.client.get_user(self.driver_id) or await interaction.client.fetch_user(self.driver_id)
                 if u:
@@ -153,7 +152,6 @@ class RatingView(discord.ui.View):
             color=discord.Color.green(),
         )
 
-    # Buttons must be declared on separate lines (the syntax error came from trying to do it inline).
     @discord.ui.button(label="1", style=discord.ButtonStyle.secondary, custom_id="rate_1")
     async def r1(self, interaction: discord.Interaction, _: discord.ui.Button):
         await self._record(interaction, 1)
@@ -217,6 +215,7 @@ class ClaimView(discord.ui.View):
             self.claimed_by = interaction.user.id
             button.disabled = True
 
+            # Update embed: set Status=Claimed/Ongoing and Driver
             msg = interaction.message
             embed = None
             if msg.embeds:
@@ -227,11 +226,21 @@ class ClaimView(discord.ui.View):
                     color=base.color,
                     timestamp=datetime.now(timezone.utc)
                 )
+                # Copy/replace fields, inject Status + Driver
+                has_status = False
                 for f in base.fields:
-                    if f.name.strip().lower() == "driver":
+                    name_lower = f.name.strip().lower()
+                    if name_lower == "status":
+                        has_status = True
+                        new.add_field(name="Status", value="Claimed / Ongoing", inline=True)
+                    elif name_lower == "driver":
                         continue
-                    new.add_field(name=f.name, value=f.value, inline=f.inline)
+                    else:
+                        new.add_field(name=f.name, value=f.value, inline=f.inline)
+                if not has_status:
+                    new.add_field(name="Status", value="Claimed / Ongoing", inline=True)
                 new.add_field(name="Driver", value=interaction.user.mention, inline=False)
+
                 if base.thumbnail and base.thumbnail.url:
                     new.set_thumbnail(url=base.thumbnail.url)
                 new.set_footer(text="Ride claimed")
@@ -264,6 +273,7 @@ class ClaimView(discord.ui.View):
 
         button.disabled = True
 
+        # Update embed: set Status=Completed
         msg = interaction.message
         embed = None
         if msg.embeds:
@@ -274,8 +284,16 @@ class ClaimView(discord.ui.View):
                 color=discord.Color.dark_grey(),
                 timestamp=datetime.now(timezone.utc)
             )
+            has_status = False
             for f in base.fields:
-                new.add_field(name=f.name, value=f.value, inline=f.inline)
+                if f.name.strip().lower() == "status":
+                    has_status = True
+                    new.add_field(name="Status", value="Completed", inline=True)
+                else:
+                    new.add_field(name=f.name, value=f.value, inline=f.inline)
+            if not has_status:
+                new.add_field(name="Status", value="Completed", inline=True)
+
             new.set_footer(text="Ride ended")
             embed = new
         await interaction.followup.edit_message(message_id=msg.id, embed=embed, view=self)
@@ -295,7 +313,7 @@ class ClaimView(discord.ui.View):
             thumbnail_url=getattr(interaction.user.display_avatar, "url", discord.Embed.Empty),
         )
 
-        # Post rating UI + comment prompt in the ride thread
+        # Rating UI + comment prompt in ride thread
         if self.thread_id:
             thread = bot.get_channel(self.thread_id)
             if isinstance(thread, discord.Thread):
@@ -335,7 +353,7 @@ class ClaimView(discord.ui.View):
                     )
 
 # -----------------------------
-# /request ride
+# /request ride  (adds Status field; rating 1–10 later)
 # -----------------------------
 request_group = app_commands.Group(name="request", description="Create ride requests")
 
@@ -370,6 +388,7 @@ async def request_ride(
     )
     e.add_field(name="Pickup", value=starting_location, inline=True)
     e.add_field(name="Destination", value=destination, inline=True)
+    e.add_field(name="Status", value="Unclaimed", inline=True)
     e.add_field(name="Requested By", value=interaction.user.mention, inline=False)
     e.set_thumbnail(url=interaction.user.display_avatar.url)
     e.set_footer(text="Click Claim to accept this ride")
@@ -408,6 +427,7 @@ async def request_ride(
             ("Pickup", starting_location, True),
             ("Destination", destination, True),
             ("Service", service_level.value, True),
+            ("Status", "Unclaimed", True),
             ("Date", today_iso(), True),
         ],
         color=color,
@@ -415,7 +435,7 @@ async def request_ride(
     )
 
 # -----------------------------
-# /log-ride
+# /log-ride  (driver-side numeric rating 1–10 for the ride)
 # -----------------------------
 @tree.command(name="log-ride", description="Log a completed ride")
 @app_commands.describe(
