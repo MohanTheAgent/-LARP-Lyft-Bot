@@ -25,11 +25,11 @@ ROLE_ID_2 = 1416063969965248594  # driver role 2
 # Global audit/activity log
 AUDIT_LOG_CHANNEL_ID = 1416392593222270976
 
-# NEW: Heads-up roles to ping for allocation/permission requests
+# Heads-up roles to ping for allocation/permission requests
 PING_ROLE_ADMIN_1 = 1416069791495622707
 PING_ROLE_ADMIN_2 = 1416069983942869113
 
-# NEW: Destination channels for new commands
+# Destination channels for new commands
 ALLOCATION_CHANNEL_ID = 1416425017406914662
 PERMISSION_CHANNEL_ID = 1416388268894720020
 
@@ -79,6 +79,9 @@ async def save_db():
 # -----------------------------
 def user_has_allowed_role(member: discord.abc.User) -> bool:
     return any(getattr(r, "id", None) in {ROLE_ID_1, ROLE_ID_2} for r in getattr(member, "roles", []))
+
+def is_approver(member: discord.abc.User) -> bool:
+    return any(getattr(r, "id", None) in {PING_ROLE_ADMIN_1, PING_ROLE_ADMIN_2} for r in getattr(member, "roles", []))
 
 def safe_float(v: str) -> Optional[float]:
     try:
@@ -185,6 +188,88 @@ class RatingView(discord.ui.View):
         await self._record(interaction, 5)
 
 # -----------------------------
+# Generic Approvals View (Accept / Deny) for allocation/permission posts
+# -----------------------------
+class ApproveDenyView(discord.ui.View):
+    def __init__(self, kind: str, requester_id: int):
+        super().__init__(timeout=None)
+        self.kind = kind  # 'allocation' or 'permission'
+        self.requester_id = requester_id
+        self.finalized = False
+
+    async def _guard(self, interaction: discord.Interaction) -> Optional[bool]:
+        if not is_approver(interaction.user):
+            await interaction.response.send_message("You are not allowed to act on this request.", ephemeral=True)
+            return False
+        if self.finalized:
+            await interaction.response.send_message("This request has already been processed.", ephemeral=True)
+            return False
+        return True
+
+    async def _finish(self, interaction: discord.Interaction, status_text: str):
+        self.finalized = True
+        for c in self.children:
+            c.disabled = True
+
+        # Update embed with Status
+        msg = interaction.message
+        new_embed = None
+        if msg.embeds:
+            base = msg.embeds[0]
+            new = discord.Embed(
+                title=base.title,
+                description=base.description,
+                color=(discord.Color.green() if status_text == "Accepted" else discord.Color.red()),
+                timestamp=datetime.now(timezone.utc),
+            )
+            has_status = False
+            for f in base.fields:
+                if f.name.strip().lower() == "status":
+                    has_status = True
+                    new.add_field(name="Status", value=status_text, inline=True)
+                else:
+                    new.add_field(name=f.name, value=f.value, inline=f.inline)
+            if not has_status:
+                new.add_field(name="Status", value=status_text, inline=True)
+            if base.thumbnail and base.thumbnail.url:
+                new.set_thumbnail(url=base.thumbnail.url)
+            new_embed = new
+
+        try:
+            await interaction.response.edit_message(embed=new_embed, view=self)
+        except discord.InteractionResponded:
+            await interaction.followup.edit_message(message_id=msg.id, embed=new_embed, view=self)
+
+        # Notify requester in-channel
+        await msg.channel.send(f"<@{self.requester_id}> Your {self.kind} request was {status_text.lower()} by {interaction.user.mention}")
+
+        # Audit
+        await send_audit_embed(
+            f"{self.kind.capitalize()} Request {status_text}",
+            fields=[
+                ("Action By", named(interaction.user), True),
+                ("Requester", f"<@{self.requester_id}>", True),
+                ("Channel", f"<#{msg.channel.id}>", True),
+                ("Message ID", str(msg.id), True),
+                ("Date", today_iso(), True),
+            ],
+            color=(discord.Color.green() if status_text == "Accepted" else discord.Color.red()),
+            thumbnail_url=getattr(interaction.user.display_avatar, "url", discord.Embed.Empty),
+        )
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="approve_btn")
+    async def approve(self, interaction: discord.Interaction, _: discord.ui.Button):
+        ok = await self._guard(interaction)
+        if ok:
+            await self._finish(interaction, "Accepted")
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="deny_btn")
+    async def deny(self, interaction: discord.Interaction, _: discord.ui.Button):
+        ok = await self._guard(interaction)
+        if ok:
+            await self._finish(interaction, "Denied")
+
+# -----------------------------
 # Claim / End view (stores thread_id to post rating there)
 # -----------------------------
 class ClaimView(discord.ui.View):
@@ -207,7 +292,6 @@ class ClaimView(discord.ui.View):
             self.claimed_by = interaction.user.id
             button.disabled = True
 
-            # Update embed: set Status=Claimed/Ongoing and Driver
             msg = interaction.message
             embed = None
             if msg.embeds:
@@ -264,7 +348,6 @@ class ClaimView(discord.ui.View):
 
         button.disabled = True
 
-        # Update embed: set Status=Completed
         msg = interaction.message
         embed = None
         if msg.embeds:
@@ -303,7 +386,6 @@ class ClaimView(discord.ui.View):
             thumbnail_url=getattr(interaction.user.display_avatar, "url", discord.Embed.Empty),
         )
 
-        # Rating UI + comment prompt in ride thread (ping rider with 1–5 buttons)
         if self.thread_id:
             thread = bot.get_channel(self.thread_id)
             if isinstance(thread, discord.Thread):
@@ -343,7 +425,7 @@ class ClaimView(discord.ui.View):
                     )
 
 # -----------------------------
-# /request ride (Status field; separator line)
+# /request ride
 # -----------------------------
 request_group = app_commands.Group(name="request", description="Create ride requests")
 
@@ -395,7 +477,6 @@ async def request_ride(
     content = f"<@&{ROLE_ID_1}> <@&{ROLE_ID_2}>"
     msg = await ch.send(content=content, embed=e, view=view, allowed_mentions=discord.AllowedMentions(roles=True))
 
-    # Create the ride thread and store it
     try:
         t = await msg.create_thread(name=f"Ride - {interaction.user.display_name}", auto_archive_duration=1440)
         view.thread_id = t.id
@@ -489,7 +570,7 @@ async def log_ride(
     await interaction.edit_original_response(content="Ride logged.")
 
 # -----------------------------
-# NEW: /allocation request
+# /allocation (with Accept/Deny buttons for approver roles)
 # -----------------------------
 @tree.command(name="allocation", description="Submit an allocation request")
 @app_commands.describe(
@@ -528,15 +609,18 @@ async def allocation_request(
     emb.add_field(name="Roles to Remove", value=roles_to_remove or "-", inline=False)
     emb.add_field(name="Proof", value=proof or "-", inline=False)
     emb.add_field(name="Date", value=today_iso(), inline=True)
+    emb.add_field(name="Status", value="Pending", inline=True)
     try:
         emb.set_thumbnail(url=role_recipient.display_avatar.url)
     except Exception:
         pass
 
     content = f"<@&{PING_ROLE_ADMIN_1}> <@&{PING_ROLE_ADMIN_2}>"
+    view = ApproveDenyView(kind="allocation", requester_id=interaction.user.id)
     await ch.send(
         content=content,
         embed=emb,
+        view=view,
         allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
     )
 
@@ -557,7 +641,7 @@ async def allocation_request(
     await interaction.followup.send("Allocation request sent.", ephemeral=True)
 
 # -----------------------------
-# NEW: /permission request
+# /permission (with Accept/Deny buttons for approver roles)
 # -----------------------------
 @tree.command(name="permission", description="Submit a permission request")
 @app_commands.describe(
@@ -596,15 +680,18 @@ async def permission_request(
     emb.add_field(name="Reason", value=reason or "-", inline=False)
     emb.add_field(name="Signed", value=signed or "-", inline=True)
     emb.add_field(name="Date", value=today_iso(), inline=True)
+    emb.add_field(name="Status", value="Pending", inline=True)
     try:
         emb.set_thumbnail(url=interaction.user.display_avatar.url)
     except Exception:
         pass
 
     content = f"<@&{PING_ROLE_ADMIN_1}> <@&{PING_ROLE_ADMIN_2}>"
+    view = ApproveDenyView(kind="permission", requester_id=interaction.user.id)
     await ch.send(
         content=content,
         embed=emb,
+        view=view,
         allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
     )
 
