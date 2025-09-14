@@ -1,4 +1,19 @@
 # -*- coding: utf-8 -*-
+# Full main.py — Lyft Bot (guild-scoped)
+# - /request ride  (with Claim/End + rating in thread, role pings)
+# - /log-ride      (logs a completed ride)
+# - /allocation    (request, reviewers Accept/Deny)
+# - /permission    (request, reviewers Accept/Deny)
+# - /promote       (reviewers only, DM + ping, logo)
+# - /infract       (reviewers only, DM + ping, logo)
+# - /ride start    (in-game rides for drivers; End Ride deletes if no other ongoing; logs as In-Game Ride Log)
+#
+# Notes:
+# * Commands restricted to GUILD_ID.
+# * Driver roles: 1416068902609223749, 1416063969965248594
+# * Ratings are 1..5, logged to 1416772722981339206
+# * Health server runs for Render; serves LYFT.png at /logo.png
+
 import os, json, asyncio
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
@@ -9,40 +24,51 @@ from dotenv import load_dotenv
 from aiohttp import web
 
 load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
 
 # =========================
 # CONFIG
 # =========================
 GUILD_ID = 1416057930381262880
 
-# Ride request channel + roles allowed to claim
+# Driver roles
+ROLE_ID_1 = 1416068902609223749
+ROLE_ID_2 = 1416063969965248594
+DRIVER_ROLES = {ROLE_ID_1, ROLE_ID_2}
+
+# Ride request posting channel (Discord riders)
 TARGET_CHANNEL_ID = 1416334665958166560
-ROLE_ID_1 = 1416068902609223749   # driver role 1
-ROLE_ID_2 = 1416063969965248594   # driver role 2
+
+# In-game rides (external riders)
+INGAME_RIDES_CHANNEL_ID = 1416777579905683557      # dashboards go here (no pings)
+INGAME_RIDE_LOG_CHANNEL_ID = 1416342987893375007   # in-game ride logs on End
 
 # Logs
-AUDIT_LOG_CHANNEL_ID = 1416392593222270976         # general audit (kept)
-RIDE_LOG_CHANNEL_ID  = 1416342987893375007         # /log-ride posts here
-RATING_LOG_CHANNEL_ID = 1416772722981339206        # <— ratings go here
+AUDIT_LOG_CHANNEL_ID   = 1416392593222270976
+RIDE_LOG_CHANNEL_ID    = 1416342987893375007       # /log-ride logs here
+RATING_LOG_CHANNEL_ID  = 1416772722981339206       # rider ratings go here
 
-# Admin reviewers (can approve allocation/permission & use /promote, /infract)
+# Admin reviewers (can approve/deny and use promote/infract)
 REVIEW_ROLE_1 = 1416069791495622707
 REVIEW_ROLE_2 = 1416069983942869113
 
 # Allocation / Permission request channels
-ALLOCATION_CHANNEL_ID = 1416425017406914662
-PERMISSION_CHANNEL_ID = 1416388268894720020
+ALLOCATION_CHANNEL_ID  = 1416425017406914662
+PERMISSION_CHANNEL_ID  = 1416388268894720020
 
 # Promotion / Infraction channels
-PROMOTE_CHANNEL_ID   = 1416423535550791730
-INFRACT_CHANNEL_ID   = 1416423631474655304
+PROMOTE_CHANNEL_ID     = 1416423535550791730
+INFRACT_CHANNEL_ID     = 1416423631474655304
 
 # Static file (logo) served by built-in web server
 LOGO_ROUTE = "/logo.png"
-TOKEN = os.getenv("DISCORD_TOKEN")
+SEPARATOR  = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
 
+# Data snapshot file
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
-SEPARATOR = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"  # exact line you asked for
+
+# Web server port (Render)
+PORT = int(os.getenv("PORT", "10000"))
 
 # =========================
 # BOT
@@ -85,7 +111,7 @@ def today_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def has_driver_role(member: discord.abc.User) -> bool:
-    return any(getattr(r, "id", None) in {ROLE_ID_1, ROLE_ID_2} for r in getattr(member, "roles", []))
+    return any(getattr(r, "id", None) in DRIVER_ROLES for r in getattr(member, "roles", []))
 
 def is_reviewer(member: discord.abc.User) -> bool:
     return any(getattr(r, "id", None) in {REVIEW_ROLE_1, REVIEW_ROLE_2} for r in getattr(member, "roles", []))
@@ -124,7 +150,7 @@ async def audit(title: str, fields: List[tuple], color: discord.Color = discord.
         emb.add_field(name=name, value=value, inline=inline)
     await send_embed(AUDIT_LOG_CHANNEL_ID, emb)
 
-# will be filled after web server starts
+# will be set once web server starts
 LOGO_URL: Optional[str] = None
 
 # =========================
@@ -199,7 +225,7 @@ class RatingView(discord.ui.View):
     async def r5(self, i: discord.Interaction, _: discord.ui.Button): await self._submit(i, 5)
 
 # =========================
-# CLAIM / END VIEW
+# CLAIM / END VIEW for /request ride (Discord riders)
 # =========================
 class ClaimView(discord.ui.View):
     def __init__(self, requester_id: int, thread_id: Optional[int] = None):
@@ -310,7 +336,7 @@ class ClaimView(discord.ui.View):
             color=discord.Color.dark_grey()
         )
 
-        # Rating prompt in thread (or fallback)
+        # Rating prompt in the thread (or fallback to channel)
         rating_embed = discord.Embed(
             title="Rate Your Driver",
             description="How much do you rate your driver?",
@@ -346,9 +372,9 @@ class ClaimView(discord.ui.View):
             )
 
 # =========================
-# /request ride
+# /request ride (Discord riders)
 # =========================
-request_group = app_commands.Group(name="request", description="Create ride requests")
+request_group = app_commands.Group(name="request", description="Create service requests")
 
 @app_commands.choices(service_level=[
     app_commands.Choice(name="Premium", value="Premium"),
@@ -652,7 +678,7 @@ async def permission(
     await interaction.followup.send("Permission request sent.", ephemeral=True)
 
 # =========================
-# /promote (reviewers only) with exact lines + logo + DM + ping on top
+# /promote (reviewers only) with lines + logo + DM + ping on top
 # =========================
 @tree.command(name="promote", description="Lyft Promotion record (reviewers only)")
 @app_commands.describe(
@@ -694,14 +720,13 @@ async def promote(
         emb.set_thumbnail(url=LOGO_URL)
 
     await send_embed(PROMOTE_CHANNEL_ID, emb, content=employee.mention, allow_users=True)
-
     try:
         await employee.send(embed=emb)
     except discord.Forbidden:
         await audit("Promotion DM Failed", [("Employee", employee.mention, True)], color=discord.Color.red())
 
 # =========================
-# /infract (reviewers only) with exact lines + logo + DM + ping on top
+# /infract (reviewers only) with lines + logo + DM + ping on top
 # =========================
 INFRACTION_CHOICES = [
     app_commands.Choice(name="Notice", value="Notice"),
@@ -758,11 +783,188 @@ async def infract(
         emb.set_thumbnail(url=LOGO_URL)
 
     await send_embed(INFRACT_CHANNEL_ID, emb, content=employee.mention, allow_users=True)
-
     try:
         await employee.send(embed=emb)
     except discord.Forbidden:
         await audit("Infraction DM Failed", [("Employee", employee.mention, True)], color=discord.Color.red())
+
+# =========================
+# /ride start (in-game) for drivers — End Ride deletes if last ongoing; logs
+# =========================
+ongoing_message_ids: set[int] = set()
+ongoing_lock = asyncio.Lock()
+
+class IngameRideView(discord.ui.View):
+    def __init__(
+        self,
+        driver_id: int,
+        rider_name: str,
+        pickup: str,
+        destination: str,
+        username: str,
+        price_estimate: str,
+        notes: str,
+    ):
+        super().__init__(timeout=None)
+        self.driver_id = driver_id
+        self.rider_name = rider_name
+        self.pickup = pickup
+        self.destination = destination
+        self.username = username
+        self.price_estimate = price_estimate
+        self.notes = notes
+        self._lock = asyncio.Lock()
+
+    @discord.ui.button(label="End Ride", style=discord.ButtonStyle.danger, custom_id="ingame:end_ride")
+    async def end_ride(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+
+        if interaction.user.id != self.driver_id:
+            return await interaction.followup.send("Only the driver who started this in-game ride can end it.", ephemeral=True)
+
+        async with self._lock:
+            message = interaction.message
+            if message is None:
+                return
+
+            # Log the ride to INGAME_RIDE_LOG_CHANNEL_ID
+            log_channel = interaction.client.get_channel(INGAME_RIDE_LOG_CHANNEL_ID)
+            if log_channel is None:
+                try:
+                    log_channel = await interaction.client.fetch_channel(INGAME_RIDE_LOG_CHANNEL_ID)
+                except discord.NotFound:
+                    log_channel = None
+
+            log_embed = discord.Embed(
+                title="In-Game Ride Log",
+                color=discord.Color.dark_grey(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            log_embed.add_field(name="Driver", value=interaction.user.mention, inline=True)
+            log_embed.add_field(name="Rider Name", value=self.rider_name, inline=True)
+            log_embed.add_field(name="Username", value=self.username, inline=True)
+            log_embed.add_field(name="Pick-Up", value=self.pickup, inline=False)
+            log_embed.add_field(name="Destination", value=self.destination, inline=False)
+            if self.price_estimate:
+                log_embed.add_field(name="Price Estimate", value=self.price_estimate, inline=True)
+            if self.notes:
+                log_embed.add_field(name="Notes", value=self.notes, inline=False)
+            log_embed.set_footer(text=f"Date: {today_iso()}")
+
+            if isinstance(log_channel, (discord.TextChannel, discord.Thread)):
+                await log_channel.send(
+                    embed=log_embed,
+                    allowed_mentions=discord.AllowedMentions(roles=False, users=False, everyone=False, replied_user=False),
+                )
+
+            # Track/delete behavior
+            async with ongoing_lock:
+                ongoing_message_ids.discard(message.id)
+                no_other_ongoing = len(ongoing_message_ids) == 0
+
+            if no_other_ongoing:
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
+            else:
+                button.disabled = True
+                if message.embeds:
+                    base = message.embeds[0]
+                    new = discord.Embed(
+                        title=base.title or "In-Game Ride",
+                        description=base.description or "",
+                        color=discord.Color.dark_grey(),
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    had_status = False
+                    for f in base.fields:
+                        if f.name.strip().lower() == "status":
+                            had_status = True
+                            new.add_field(name="Status", value="Completed", inline=True)
+                        else:
+                            new.add_field(name=f.name, value=f.value, inline=f.inline)
+                    if not had_status:
+                        new.add_field(name="Status", value="Completed", inline=True)
+                    if base.thumbnail and base.thumbnail.url:
+                        new.set_thumbnail(url=base.thumbnail.url)
+                    if base.footer and base.footer.text:
+                        new.set_footer(text=base.footer.text)
+                    try:
+                        await interaction.followup.edit_message(message_id=message.id, embed=new, view=self)
+                    except discord.HTTPException:
+                        pass
+
+ride_group = app_commands.Group(name="ride", description="Driver in-game ride actions")
+
+@ride_group.command(name="start", description="Start an in-game ride (for non-Discord riders)")
+@app_commands.describe(
+    rider_name="Passenger name/callsign",
+    pickup="Pick-Up location",
+    destination="Destination",
+    username="Rider's username (in-game)",
+    price_estimate="Quoted price / estimate",
+    notes="Extra info (landmarks, clothing color, etc.)",
+)
+async def ride_start(
+    interaction: discord.Interaction,
+    rider_name: str,
+    pickup: str,
+    destination: str,
+    username: str,
+    price_estimate: str = "",
+    notes: str = "",
+):
+    if interaction.guild_id != GUILD_ID:
+        return await interaction.response.send_message("This command isn't available here.", ephemeral=True)
+    if not has_driver_role(interaction.user):
+        return await interaction.response.send_message("Drivers only.", ephemeral=True)
+
+    await interaction.response.send_message("In-game ride started.", ephemeral=True)
+
+    emb = discord.Embed(
+        title="In-Game Ride",
+        description="Ride created for a rider outside Discord.",
+        color=discord.Color.teal(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    emb.add_field(name="Rider Name", value=rider_name, inline=True)
+    emb.add_field(name="Username", value=username, inline=True)
+    emb.add_field(name="Status", value="In Progress", inline=True)
+    emb.add_field(name="Pick-Up", value=pickup, inline=False)
+    emb.add_field(name="Destination", value=destination, inline=False)
+    if price_estimate:
+        emb.add_field(name="Price Estimate", value=price_estimate, inline=True)
+    if notes:
+        emb.add_field(name="Notes", value=notes, inline=False)
+    emb.add_field(name="Driver", value=interaction.user.mention, inline=True)
+    emb.set_footer(text=f"Date: {today_iso()}")
+
+    view = IngameRideView(
+        driver_id=interaction.user.id,
+        rider_name=rider_name,
+        pickup=pickup,
+        destination=destination,
+        username=username,
+        price_estimate=price_estimate,
+        notes=notes,
+    )
+
+    channel = interaction.client.get_channel(INGAME_RIDES_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await interaction.client.fetch_channel(INGAME_RIDES_CHANNEL_ID)
+        except discord.NotFound:
+            return
+
+    msg = await channel.send(
+        embed=emb,
+        view=view,
+        allowed_mentions=discord.AllowedMentions(roles=False, users=False, everyone=False, replied_user=False),
+    )
+
+    async with ongoing_lock:
+        ongoing_message_ids.add(msg.id)
 
 # =========================
 # READY + SYNC + WEB (serve LYFT.png at /logo.png)
@@ -772,14 +974,15 @@ async def on_ready():
     await load_db()
     guild = discord.Object(id=GUILD_ID)
     tree.add_command(request_group, guild=guild)
+    tree.add_command(ride_group, guild=guild)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"Logged in as {bot.user} (ID: {bot.user.id}) — commands synced")
 
 # Web server to serve logo and health
-async def handle_logo(request):
+async def handle_logo(_):
     filepath = os.path.join(os.path.dirname(__file__), "LYFT.png")
-    return web.FileResponse(filepath)
+    return web.FileResponse(filepath) if os.path.exists(filepath) else web.Response(status=404)
 
 async def handle_health(_):
     return web.Response(text="OK")
@@ -791,8 +994,7 @@ async def start_web_server():
     app.router.add_get("/", handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.getenv("PORT", "10000"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     host = os.getenv("RENDER_EXTERNAL_URL")
     if host:
@@ -800,9 +1002,12 @@ async def start_web_server():
             host = "https://" + host
         LOGO_URL = host.rstrip("/") + LOGO_ROUTE
     else:
-        LOGO_URL = f"http://localhost:{port}{LOGO_ROUTE}"
-    print(f"HTTP server listening on 0.0.0.0:{port} | LOGO_URL={LOGO_URL}")
+        LOGO_URL = f"http://localhost:{PORT}{LOGO_ROUTE}"
+    print(f"HTTP server listening on 0.0.0.0:{PORT} | LOGO_URL={LOGO_URL}")
 
+# =========================
+# MAIN
+# =========================
 async def main():
     if not TOKEN:
         raise RuntimeError("Missing DISCORD_TOKEN")
