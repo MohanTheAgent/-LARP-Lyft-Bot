@@ -15,29 +15,33 @@ load_dotenv()
 # =========================
 GUILD_ID = 1416057930381262880
 
-# Ride posting + driver roles
+# Ride request channel + roles allowed to claim
 TARGET_CHANNEL_ID = 1416334665958166560
-ROLE_ID_1 = 1416068902609223749   # drivers (can claim; can submit allocation/permission)
-ROLE_ID_2 = 1416063969965248594   # drivers (can claim)
+ROLE_ID_1 = 1416068902609223749   # driver role 1
+ROLE_ID_2 = 1416063969965248594   # driver role 2
 
 # Logs
 AUDIT_LOG_CHANNEL_ID = 1416392593222270976
 RIDE_LOG_CHANNEL_ID  = 1416342987893375007
 
-# Admin reviewers (can Accept/Deny allocation/permission & use /promote, /infract)
-PING_ROLE_ADMIN_1 = 1416069791495622707
-PING_ROLE_ADMIN_2 = 1416069983942869113
+# Admin reviewers (can approve allocation/permission & use /promote, /infract)
+REVIEW_ROLE_1 = 1416069791495622707
+REVIEW_ROLE_2 = 1416069983942869113
 
-# Allocation / Permission destination channels
+# Allocation / Permission request channels
 ALLOCATION_CHANNEL_ID = 1416425017406914662
 PERMISSION_CHANNEL_ID = 1416388268894720020
 
-# Promotion / Infraction destination channels
+# Promotion / Infraction channels
 PROMOTE_CHANNEL_ID   = 1416423535550791730
 INFRACT_CHANNEL_ID   = 1416423631474655304
 
+# Static file (logo) served by built-in web server
+LOGO_ROUTE = "/logo.png"
 TOKEN = os.getenv("DISCORD_TOKEN")
+
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
+SEPARATOR = "????????????????????"  # provided white line
 
 # =========================
 # BOT
@@ -47,7 +51,7 @@ bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
 # =========================
-# JSON "DB"
+# JSON "DB" (riders ratings/logs)
 # =========================
 _db_lock = asyncio.Lock()
 _db: Dict[str, Any] = {"riders": {}}
@@ -79,11 +83,11 @@ async def save_db():
 def today_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-def user_has_allowed_role(member: discord.abc.User) -> bool:
+def has_driver_role(member: discord.abc.User) -> bool:
     return any(getattr(r, "id", None) in {ROLE_ID_1, ROLE_ID_2} for r in getattr(member, "roles", []))
 
 def is_reviewer(member: discord.abc.User) -> bool:
-    return any(getattr(r, "id", None) in {PING_ROLE_ADMIN_1, PING_ROLE_ADMIN_2} for r in getattr(member, "roles", []))
+    return any(getattr(r, "id", None) in {REVIEW_ROLE_1, REVIEW_ROLE_2} for r in getattr(member, "roles", []))
 
 def safe_float(v: str) -> Optional[float]:
     try: return float(v)
@@ -102,7 +106,8 @@ async def send_embed(
     view: Optional[discord.ui.View]=None
 ):
     ch = bot.get_channel(channel_id)
-    if not isinstance(ch, (discord.TextChannel, discord.Thread)): return None
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return None
     return await ch.send(
         content=content or None,
         embed=embed,
@@ -118,21 +123,20 @@ async def audit(title: str, fields: List[tuple], color: discord.Color = discord.
         emb.add_field(name=name, value=value, inline=inline)
     await send_embed(AUDIT_LOG_CHANNEL_ID, emb)
 
-def guild_logo(interaction: discord.Interaction) -> Optional[str]:
-    try:
-        if interaction.guild and interaction.guild.icon:
-            return interaction.guild.icon.url
-    except Exception:
-        pass
-    return None
+def logo_url_from_request(request) -> str:
+    # Construct absolute URL to serve LYFT.png
+    scheme = request.scheme if hasattr(request, "scheme") else "https"
+    host = request.host if hasattr(request, "host") else os.getenv("RENDER_EXTERNAL_URL", "http://localhost:10000")
+    return f"{scheme}://{host}{LOGO_ROUTE}"
 
-SEPARATOR = "????????????????????"
+# Will be set on startup after web server binds
+LOGO_URL: Optional[str] = None
 
 # =========================
 # RATING VIEW (1..5)
 # =========================
 class RatingView(discord.ui.View):
-    """Buttons 1..5; only the rider may click; saves to data.json, edits embed, thanks them."""
+    # Only rider can click. Saves to data.json and thanks them.
     def __init__(self, rider_id: int, driver_id: int):
         super().__init__(timeout=600)
         self.rider_id = rider_id
@@ -143,13 +147,12 @@ class RatingView(discord.ui.View):
         if interaction.user.id != self.rider_id:
             return await interaction.response.send_message("Only the rider can submit a rating for this ride.", ephemeral=True)
         if self.submitted:
-            return await interaction.response.send_message("You already submitted a rating. Thank you!", ephemeral=True)
+            return await interaction.response.send_message("You already submitted a rating. Thank you.", ephemeral=True)
 
         self.submitted = True
         for c in self.children:
             c.disabled = True
 
-        # Save rating
         async with _db_lock:
             riders = _db.setdefault("riders", {})
             rec = riders.setdefault(str(self.rider_id), {"name": interaction.user.name, "rides": [], "ratings": []})
@@ -161,13 +164,13 @@ class RatingView(discord.ui.View):
             })
         await save_db()
 
-        # Edit embed to show selected
+        # Edit embed to show result
         msg = interaction.message
         if msg and msg.embeds:
             base = msg.embeds[0]
             new = discord.Embed(
                 title=base.title,
-                description=f"Thanks! You rated your driver **{score}/5**.",
+                description=f"Thanks. You rated your driver {score}/5.",
                 color=discord.Color.green(),
                 timestamp=datetime.now(timezone.utc)
             )
@@ -179,9 +182,7 @@ class RatingView(discord.ui.View):
 
         await audit(
             "Ride Rated",
-            [("Rider", f"<@{self.rider_id}>", True),
-             ("Driver", f"<@{self.driver_id}>", True),
-             ("Score", f"{score}/5", True)],
+            [("Rider", f"<@{self.rider_id}>", True), ("Driver", f"<@{self.driver_id}>", True), ("Score", f"{score}/5", True)],
             color=discord.Color.green()
         )
 
@@ -200,7 +201,6 @@ class RatingView(discord.ui.View):
 # CLAIM / END VIEW
 # =========================
 class ClaimView(discord.ui.View):
-    """Claim / End Ride; updates the request embed; prompts rating at end."""
     def __init__(self, requester_id: int, thread_id: Optional[int] = None):
         super().__init__(timeout=None)
         self.requester_id = requester_id
@@ -212,7 +212,7 @@ class ClaimView(discord.ui.View):
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         async with self._lock:
-            if not user_has_allowed_role(interaction.user):
+            if not has_driver_role(interaction.user):
                 return await interaction.followup.send("You are not authorized to claim rides.", ephemeral=True)
             if self.claimed_by is not None:
                 return await interaction.followup.send("This ride has already been claimed.", ephemeral=True)
@@ -220,7 +220,6 @@ class ClaimView(discord.ui.View):
             self.claimed_by = interaction.user.id
             button.disabled = True
 
-            # Update the original embed
             msg = interaction.message
             if msg.embeds:
                 base = msg.embeds[0]
@@ -241,7 +240,6 @@ class ClaimView(discord.ui.View):
                 new.set_footer(text="Ride claimed")
                 await interaction.followup.edit_message(message_id=msg.id, embed=new, view=self)
 
-            # "Driver Assigned" embed and ping rider
             assigned = discord.Embed(
                 title="Driver Assigned",
                 description=f"Your driver is {interaction.user.mention}.",
@@ -273,7 +271,7 @@ class ClaimView(discord.ui.View):
 
         button.disabled = True
 
-        # Update original embed to "Completed"
+        # Update original embed to completed
         msg = interaction.message
         if msg.embeds:
             base = msg.embeds[0]
@@ -295,7 +293,6 @@ class ClaimView(discord.ui.View):
             new.set_footer(text="Ride ended")
             await interaction.followup.edit_message(message_id=msg.id, embed=new, view=self)
 
-        # Post "Ride Completed" embed
         ended = discord.Embed(
             title="Ride Completed",
             description=f"Ride ended by {interaction.user.mention}.",
@@ -319,7 +316,6 @@ class ClaimView(discord.ui.View):
             color=discord.Color.blurple(),
             timestamp=datetime.now(timezone.utc)
         )
-        # put a small divider for style
         rating_embed.add_field(name="\u200b", value=SEPARATOR, inline=False)
         rating_view = RatingView(rider_id=self.requester_id, driver_id=interaction.user.id)
 
@@ -349,7 +345,7 @@ class ClaimView(discord.ui.View):
             )
 
 # =========================
-# /REQUEST ride
+# /request ride
 # =========================
 request_group = app_commands.Group(name="request", description="Create ride requests")
 
@@ -425,7 +421,7 @@ async def request_ride(
     )
 
 # =========================
-# /LOG-RIDE  --> posts to RIDE_LOG_CHANNEL_ID
+# /log-ride -> RIDE_LOG_CHANNEL_ID
 # =========================
 @tree.command(name="log-ride", description="Log a completed ride")
 @app_commands.describe(
@@ -447,13 +443,12 @@ async def log_ride(
 
     if interaction.guild_id != GUILD_ID:
         return await interaction.edit_original_response(content="This command is not available in this server.")
-    if not user_has_allowed_role(interaction.user):
+    if not has_driver_role(interaction.user):
         return await interaction.edit_original_response(content="You are not authorized to use this command.")
 
     income_val = safe_float(income)
     rides_val = safe_int(rides_this_week)
 
-    # Save basic log onto rider record
     async with _db_lock:
         riders = _db.setdefault("riders", {})
         rec = riders.setdefault(str(rider.id), {"name": rider.name, "rides": [], "ratings": []})
@@ -469,7 +464,6 @@ async def log_ride(
         })
     await save_db()
 
-    # Build log embed
     emb = discord.Embed(
         title="Ride Logged",
         color=discord.Color.dark_grey(),
@@ -480,7 +474,7 @@ async def log_ride(
     emb.add_field(name="Ride Link", value=ride_link, inline=False)
     emb.add_field(name="Income", value=(f"${income_val:,.2f}" if income_val is not None else income), inline=True)
     emb.add_field(name="Rides This Week", value=(str(rides_val) if rides_val is not None else rides_this_week), inline=True)
-    emb.add_field(name="Comment", value=(comment or "—"), inline=False)
+    emb.add_field(name="Comment", value=(comment or "-"), inline=False)
     emb.set_thumbnail(url=rider.display_avatar.url)
     emb.set_footer(text=f"Date: {today_iso()}")
 
@@ -489,12 +483,12 @@ async def log_ride(
     await audit("Ride Logged", [("Rider", rider.mention, True), ("Driver", interaction.user.mention, True)], color=discord.Color.dark_grey())
 
 # =========================
-# APPROVALS (ALLOCATION / PERMISSION)
+# ALLOCATION / PERMISSION with Approve/Deny
 # =========================
 class ApproveDenyView(discord.ui.View):
     def __init__(self, kind: str, requester_id: int):
         super().__init__(timeout=None)
-        self.kind = kind  # 'allocation' | 'permission'
+        self.kind = kind
         self.requester_id = requester_id
         self.finalized = False
 
@@ -511,7 +505,6 @@ class ApproveDenyView(discord.ui.View):
         self.finalized = True
         for c in self.children: c.disabled = True
 
-        # Update original embed with Status (with emoji)
         msg = interaction.message
         if msg.embeds:
             base = msg.embeds[0]
@@ -530,15 +523,11 @@ class ApproveDenyView(discord.ui.View):
                     new.add_field(name=f.name, value=f.value, inline=f.inline)
             if not had_status:
                 new.add_field(name="Status", value=f"{symbol} {decision}", inline=True)
-            if base.thumbnail and base.thumbnail.url:
-                new.set_thumbnail(url=base.thumbnail.url)
-
             try:
                 await interaction.response.edit_message(embed=new, view=self)
             except discord.InteractionResponded:
                 await interaction.followup.edit_message(message_id=msg.id, embed=new, view=self)
 
-        # Decision embed, ping requester
         dec = discord.Embed(
             title=f"{self.kind.capitalize()} Request {decision}",
             description=f"{self.kind.capitalize()} request was {decision.lower()} by {interaction.user.mention}.",
@@ -572,8 +561,8 @@ class ApproveDenyView(discord.ui.View):
 @tree.command(name="allocation", description="Submit an allocation request")
 @app_commands.describe(
     role_recipient="User who will receive role changes",
-    roles_to_give="Role(s) to give (names/IDs, comma separated)",
-    roles_to_remove="Role(s) to remove (names/IDs, comma separated)",
+    roles_to_give="Roles to give (names/IDs, comma separated)",
+    roles_to_remove="Roles to remove (names/IDs, comma separated)",
     proof="Proof (URL or description)"
 )
 async def allocation(
@@ -598,14 +587,13 @@ async def allocation(
     )
     emb.add_field(name="Requested By", value=interaction.user.mention, inline=True)
     emb.add_field(name="Recipient", value=role_recipient.mention, inline=True)
-    emb.add_field(name="Roles to Give", value=roles_to_give or "—", inline=False)
-    emb.add_field(name="Roles to Remove", value=roles_to_remove or "—", inline=False)
-    emb.add_field(name="Proof", value=proof or "—", inline=False)
+    emb.add_field(name="Roles to Give", value=roles_to_give or "-", inline=False)
+    emb.add_field(name="Roles to Remove", value=roles_to_remove or "-", inline=False)
+    emb.add_field(name="Proof", value=proof or "-", inline=False)
     emb.add_field(name="Status", value="?? Pending", inline=True)
     emb.add_field(name="Date", value=today_iso(), inline=True)
-    if (logo := guild_logo(interaction)): emb.set_thumbnail(url=logo)
 
-    content = f"<@&{PING_ROLE_ADMIN_1}> <@&{PING_ROLE_ADMIN_2}>"
+    content = f"<@&{REVIEW_ROLE_1}> <@&{REVIEW_ROLE_2}>"
     view = ApproveDenyView(kind="allocation", requester_id=interaction.user.id)
     await send_embed(ALLOCATION_CHANNEL_ID, emb, content=content, allow_roles=True, view=view)
 
@@ -644,15 +632,14 @@ async def permission(
         timestamp=datetime.now(timezone.utc)
     )
     emb.add_field(name="Requested By", value=interaction.user.mention, inline=True)
-    emb.add_field(name="Permission", value=permission or "—", inline=False)
-    emb.add_field(name="Duration", value=duration or "—", inline=True)
-    emb.add_field(name="Reason", value=reason or "—", inline=False)
-    emb.add_field(name="Signed", value=signed or "—", inline=True)
+    emb.add_field(name="Permission", value=permission or "-", inline=False)
+    emb.add_field(name="Duration", value=duration or "-", inline=True)
+    emb.add_field(name="Reason", value=reason or "-", inline=False)
+    emb.add_field(name="Signed", value=signed or "-", inline=True)
     emb.add_field(name="Status", value="?? Pending", inline=True)
     emb.add_field(name="Date", value=today_iso(), inline=True)
-    if (logo := guild_logo(interaction)): emb.set_thumbnail(url=logo)
 
-    content = f"<@&{PING_ROLE_ADMIN_1}> <@&{PING_ROLE_ADMIN_2}>"
+    content = f"<@&{REVIEW_ROLE_1}> <@&{REVIEW_ROLE_2}>"
     view = ApproveDenyView(kind="permission", requester_id=interaction.user.id)
     await send_embed(PERMISSION_CHANNEL_ID, emb, content=content, allow_roles=True, view=view)
 
@@ -664,7 +651,7 @@ async def permission(
     await interaction.followup.send("Permission request sent.", ephemeral=True)
 
 # =========================
-# /promote  (reviewers only)  -> to PROMOTE_CHANNEL_ID + DM employee, ping on top
+# /promote (reviewers only) with logo + DM + ping on top
 # =========================
 @tree.command(name="promote", description="Lyft Promotion record (reviewers only)")
 @app_commands.describe(
@@ -687,47 +674,33 @@ async def promote(
     if not is_reviewer(interaction.user):
         return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
 
-    await interaction.response.send_message("Submitting promotion...", ephemeral=True)
+    await interaction.response.send_message("Promotion logged.", ephemeral=True)
 
     desc = (
         "Lyft Promotion Log!\n"
         f"{SEPARATOR}\n"
-        f"**Employee:** {employee.mention}\n\n"
-        f"**Old Rank:** {old_rank}\n"
-        f"**New Rank:** {new_rank}\n\n"
+        f"Employee: {employee.mention}\n"
+        f"Old Rank: {old_rank}\n"
+        f"New Rank: {new_rank}\n"
         f"{SEPARATOR}\n"
-        f"**Reason:** {reason}\n"
-        f"**Notes:** {notes or 'N/A'}\n\n"
+        f"Reason: {reason}\n"
+        f"Notes: {notes or 'N/A'}\n"
         f"{SEPARATOR}\n"
-        f"Issued by: {interaction.user.mention}"
+        f"Processed by: {interaction.user.mention}"
     )
+    emb = discord.Embed(description=desc, color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
+    if LOGO_URL:
+        emb.set_thumbnail(url=LOGO_URL)
 
-    emb = discord.Embed(
-        title="",
-        description=desc,
-        color=discord.Color.green(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    if (logo := guild_logo(interaction)): emb.set_thumbnail(url=logo)
+    await send_embed(PROMOTE_CHANNEL_ID, emb, content=employee.mention, allow_users=True)
 
-    # Send to channel, ping employee on top
-    await send_embed(
-        PROMOTE_CHANNEL_ID,
-        emb,
-        content=f"{employee.mention}",
-        allow_users=True
-    )
-
-    # DM employee
     try:
         await employee.send(embed=emb)
     except discord.Forbidden:
         await audit("Promotion DM Failed", [("Employee", employee.mention, True)], color=discord.Color.red())
 
-    await interaction.edit_original_response(content="Promotion recorded.")
-
 # =========================
-# /infract  (reviewers only) -> to INFRACT_CHANNEL_ID + DM employee, ping on top
+# /infract (reviewers only) with logo + DM + ping on top
 # =========================
 INFRACTION_CHOICES = [
     app_commands.Choice(name="Notice", value="Notice"),
@@ -744,9 +717,9 @@ INFRACTION_CHOICES = [
     employee="User receiving infraction",
     infraction_type="Type of infraction",
     reason="Reason",
-    proof="Proof link(s)",
+    proof="Proof links or description",
     notes="Optional notes",
-    appealable="Is it appealable? yes/no (optional)"
+    appealable="Appealable? yes/no (optional)"
 )
 @app_commands.choices(infraction_type=INFRACTION_CHOICES)
 async def infract(
@@ -763,49 +736,35 @@ async def infract(
     if not is_reviewer(interaction.user):
         return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
 
-    await interaction.response.send_message("Submitting infraction...", ephemeral=True)
+    await interaction.response.send_message("Infraction logged.", ephemeral=True)
 
-    appeal_display = "?" if (appealable or "").lower().startswith("y") else "?"
+    appeal_display = "Yes" if (appealable or "").lower().startswith("y") else "No"
 
     desc = (
         "Lyft Infraction Log!\n"
         f"{SEPARATOR}\n"
-        f"**Officer:** {interaction.user.mention}\n\n"
-        f"**Reason:** {reason}\n\n"
-        f"**Infraction Type:** {infraction_type.value}\n\n"
-        f"**Appealable:** {appeal_display}\n\n"
-        f"**Proof:** {proof or 'N/A'}\n"
-        f"**Notes:** {notes or 'N/A'}\n\n"
+        f"Officer: {interaction.user.mention}\n"
+        f"Reason: {reason}\n"
+        f"Infraction Type: {infraction_type.value}\n"
+        f"Appealable: {appeal_display}\n"
+        f"Proof: {proof or 'N/A'}\n"
+        f"Notes: {notes or 'N/A'}\n"
         f"{SEPARATOR}\n"
         f"Issued to: {employee.mention}"
     )
+    emb = discord.Embed(description=desc, color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
+    if LOGO_URL:
+        emb.set_thumbnail(url=LOGO_URL)
 
-    emb = discord.Embed(
-        title="",
-        description=desc,
-        color=discord.Color.red(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    if (logo := guild_logo(interaction)): emb.set_thumbnail(url=logo)
+    await send_embed(INFRACT_CHANNEL_ID, emb, content=employee.mention, allow_users=True)
 
-    # Send to channel, ping employee on top
-    await send_embed(
-        INFRACT_CHANNEL_ID,
-        emb,
-        content=f"{employee.mention}",
-        allow_users=True
-    )
-
-    # DM employee
     try:
         await employee.send(embed=emb)
     except discord.Forbidden:
         await audit("Infraction DM Failed", [("Employee", employee.mention, True)], color=discord.Color.red())
 
-    await interaction.edit_original_response(content="Infraction recorded.")
-
 # =========================
-# READY + SYNC + WEB
+# READY + SYNC + WEB (serve LYFT.png at /logo.png)
 # =========================
 @bot.event
 async def on_ready():
@@ -824,20 +783,39 @@ async def on_ready():
     await send_embed(AUDIT_LOG_CHANNEL_ID, started)
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-async def health(_): return web.Response(text="OK")
-async def webserver():
+# Web server to serve logo and health
+async def handle_logo(request):
+    # Ensure LYFT.png exists in the working directory
+    filepath = os.path.join(os.path.dirname(__file__), "LYFT.png")
+    return web.FileResponse(filepath)
+
+async def handle_health(_):
+    return web.Response(text="OK")
+
+async def start_web_server():
+    global LOGO_URL
     app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
+    app.router.add_get(LOGO_ROUTE, handle_logo)
+    app.router.add_get("/", handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", "10000"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    # Set absolute URL once server is up; try to infer from Render
+    host = os.getenv("RENDER_EXTERNAL_URL")
+    if host:
+        if not host.startswith("http"):
+            host = "https://" + host
+        LOGO_URL = host.rstrip("/") + LOGO_ROUTE
+    else:
+        LOGO_URL = f"http://localhost:{port}{LOGO_ROUTE}"
+    print(f"HTTP server listening on 0.0.0.0:{port} | LOGO_URL={LOGO_URL}")
 
 async def main():
-    if not TOKEN: raise RuntimeError("Missing DISCORD_TOKEN")
-    await webserver()
+    if not TOKEN:
+        raise RuntimeError("Missing DISCORD_TOKEN")
+    await start_web_server()
     await bot.start(TOKEN)
 
 if __name__ == "__main__":
