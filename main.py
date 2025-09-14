@@ -16,10 +16,23 @@ load_dotenv()
 # CONFIG
 # -----------------------------
 GUILD_ID = 1416057930381262880
-TARGET_CHANNEL_ID = 1416334665958166560        # ride request posts
-ROLE_ID_1 = 1416068902609223749                # driver role 1
-ROLE_ID_2 = 1416063969965248594                # driver role 2
-AUDIT_LOG_CHANNEL_ID = 1416392593222270976     # all logs here
+
+# Ride request posts + roles that are allowed to claim
+TARGET_CHANNEL_ID = 1416334665958166560
+ROLE_ID_1 = 1416068902609223749  # driver role 1 (also allowed to use new commands)
+ROLE_ID_2 = 1416063969965248594  # driver role 2
+
+# Global audit/activity log
+AUDIT_LOG_CHANNEL_ID = 1416392593222270976
+
+# NEW: Heads-up roles to ping for allocation/permission requests
+PING_ROLE_ADMIN_1 = 1416069791495622707
+PING_ROLE_ADMIN_2 = 1416069983942869113
+
+# NEW: Destination channels for new commands
+ALLOCATION_CHANNEL_ID = 1416425017406914662
+PERMISSION_CHANNEL_ID = 1416388268894720020
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
 
@@ -474,6 +487,142 @@ async def log_ride(
     )
 
     await interaction.edit_original_response(content="Ride logged.")
+
+# -----------------------------
+# NEW: /allocation request
+# -----------------------------
+@tree.command(name="allocation", description="Submit an allocation request")
+@app_commands.describe(
+    role_recipient="User who will receive role changes",
+    roles_to_give="Role(s) to be given (names or IDs, comma separated)",
+    roles_to_remove="Role(s) to be removed (names or IDs, comma separated)",
+    proof="Proof (URL or description)"
+)
+async def allocation_request(
+    interaction: discord.Interaction,
+    role_recipient: discord.User,
+    roles_to_give: str,
+    roles_to_remove: str,
+    proof: str
+):
+    if interaction.guild_id != GUILD_ID:
+        return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
+    if not any(getattr(r, "id", None) == ROLE_ID_1 for r in getattr(interaction.user, "roles", [])):
+        return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
+
+    await interaction.response.send_message("Submitting allocation request...", ephemeral=True)
+
+    ch = bot.get_channel(ALLOCATION_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        return await interaction.followup.send("Allocation channel not found.", ephemeral=True)
+
+    emb = discord.Embed(
+        title="Allocation Request",
+        color=discord.Color.dark_teal(),
+        timestamp=datetime.now(timezone.utc),
+        description="A driver has submitted an allocation request for review."
+    )
+    emb.add_field(name="Requested By", value=named(interaction.user), inline=True)
+    emb.add_field(name="Recipient", value=named(role_recipient), inline=True)
+    emb.add_field(name="Roles to Give", value=roles_to_give or "-", inline=False)
+    emb.add_field(name="Roles to Remove", value=roles_to_remove or "-", inline=False)
+    emb.add_field(name="Proof", value=proof or "-", inline=False)
+    emb.add_field(name="Date", value=today_iso(), inline=True)
+    try:
+        emb.set_thumbnail(url=role_recipient.display_avatar.url)
+    except Exception:
+        pass
+
+    content = f"<@&{PING_ROLE_ADMIN_1}> <@&{PING_ROLE_ADMIN_2}>"
+    await ch.send(
+        content=content,
+        embed=emb,
+        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
+    )
+
+    await send_audit_embed(
+        "Allocation Request Logged",
+        fields=[
+            ("By", named(interaction.user), True),
+            ("Recipient", named(role_recipient), True),
+            ("Give", roles_to_give or "-", False),
+            ("Remove", roles_to_remove or "-", False),
+            ("Proof", (proof or "-")[:512], False),
+            ("Date", today_iso(), True),
+        ],
+        color=discord.Color.dark_teal(),
+        thumbnail_url=getattr(role_recipient.display_avatar, "url", discord.Embed.Empty),
+    )
+
+    await interaction.followup.send("Allocation request sent.", ephemeral=True)
+
+# -----------------------------
+# NEW: /permission request
+# -----------------------------
+@tree.command(name="permission", description="Submit a permission request")
+@app_commands.describe(
+    permission="Permission requested",
+    duration="Requested duration",
+    reason="Reason for the permission",
+    signed="Your signature (name/ID)"
+)
+async def permission_request(
+    interaction: discord.Interaction,
+    permission: str,
+    duration: str,
+    reason: str,
+    signed: str
+):
+    if interaction.guild_id != GUILD_ID:
+        return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
+    if not any(getattr(r, "id", None) == ROLE_ID_1 for r in getattr(interaction.user, "roles", [])):
+        return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
+
+    await interaction.response.send_message("Submitting permission request...", ephemeral=True)
+
+    ch = bot.get_channel(PERMISSION_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        return await interaction.followup.send("Permission channel not found.", ephemeral=True)
+
+    emb = discord.Embed(
+        title="Permission Request",
+        color=discord.Color.dark_gold(),
+        timestamp=datetime.now(timezone.utc),
+        description="A driver has submitted a permission request for approval."
+    )
+    emb.add_field(name="Requested By", value=named(interaction.user), inline=True)
+    emb.add_field(name="Permission", value=permission or "-", inline=False)
+    emb.add_field(name="Duration", value=duration or "-", inline=True)
+    emb.add_field(name="Reason", value=reason or "-", inline=False)
+    emb.add_field(name="Signed", value=signed or "-", inline=True)
+    emb.add_field(name="Date", value=today_iso(), inline=True)
+    try:
+        emb.set_thumbnail(url=interaction.user.display_avatar.url)
+    except Exception:
+        pass
+
+    content = f"<@&{PING_ROLE_ADMIN_1}> <@&{PING_ROLE_ADMIN_2}>"
+    await ch.send(
+        content=content,
+        embed=emb,
+        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
+    )
+
+    await send_audit_embed(
+        "Permission Request Logged",
+        fields=[
+            ("By", named(interaction.user), True),
+            ("Permission", permission or "-", False),
+            ("Duration", duration or "-", True),
+            ("Reason", (reason or "-")[:512], False),
+            ("Signed", signed or "-", True),
+            ("Date", today_iso(), True),
+        ],
+        color=discord.Color.dark_gold(),
+        thumbnail_url=getattr(interaction.user.display_avatar, "url", discord.Embed.Empty),
+    )
+
+    await interaction.followup.send("Permission request sent.", ephemeral=True)
 
 # -----------------------------
 # Ready / sync
