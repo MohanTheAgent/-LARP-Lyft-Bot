@@ -872,7 +872,7 @@ class IngameRideView(discord.ui.View):
                     log_channel = await interaction.client.fetch_channel(INGAME_RIDE_LOG_CHANNEL_ID)
                 except discord.NotFound:
                     log_channel = None
-
+            
             log_embed = discord.Embed(
                 title="In-Game Ride Log",
                 color=discord.Color.dark_grey(),
@@ -889,12 +889,19 @@ class IngameRideView(discord.ui.View):
                 log_embed.add_field(name="Notes", value=self.notes, inline=False)
             log_embed.set_footer(text=f"Date: {today_iso()}")
 
+            # Send the ride log (ping DRIVER only)
             if isinstance(log_channel, (discord.TextChannel, discord.Thread)):
                 await log_channel.send(
                     content=interaction.user.mention,  # ping driver at top
                     embed=log_embed,
-                    allowed_mentions=discord.AllowedMentions(roles=False, users=True, everyone=False, replied_user=False),
+                    allowed_mentions=discord.AllowedMentions(
+                        roles=False,
+                        users=True,
+                        everyone=False,
+                        replied_user=False
+                    ),
                 )
+ 
 
             # Track/delete behavior
             async with ongoing_lock:
