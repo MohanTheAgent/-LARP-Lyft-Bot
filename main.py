@@ -21,8 +21,9 @@ ROLE_ID_1 = 1416068902609223749   # driver role 1
 ROLE_ID_2 = 1416063969965248594   # driver role 2
 
 # Logs
-AUDIT_LOG_CHANNEL_ID = 1416392593222270976
-RIDE_LOG_CHANNEL_ID  = 1416342987893375007
+AUDIT_LOG_CHANNEL_ID = 1416392593222270976         # general audit (kept)
+RIDE_LOG_CHANNEL_ID  = 1416342987893375007         # /log-ride posts here
+RATING_LOG_CHANNEL_ID = 1416772722981339206        # <— ratings go here
 
 # Admin reviewers (can approve allocation/permission & use /promote, /infract)
 REVIEW_ROLE_1 = 1416069791495622707
@@ -127,10 +128,9 @@ async def audit(title: str, fields: List[tuple], color: discord.Color = discord.
 LOGO_URL: Optional[str] = None
 
 # =========================
-# RATING VIEW (1..5)
+# RATING VIEW (1..5) — logs to RATING_LOG_CHANNEL_ID
 # =========================
 class RatingView(discord.ui.View):
-    # Only rider can click. Saves to data.json and thanks them.
     def __init__(self, rider_id: int, driver_id: int):
         super().__init__(timeout=600)
         self.rider_id = rider_id
@@ -147,6 +147,7 @@ class RatingView(discord.ui.View):
         for c in self.children:
             c.disabled = True
 
+        # Save rating
         async with _db_lock:
             riders = _db.setdefault("riders", {})
             rec = riders.setdefault(str(self.rider_id), {"name": interaction.user.name, "rides": [], "ratings": []})
@@ -158,7 +159,7 @@ class RatingView(discord.ui.View):
             })
         await save_db()
 
-        # Edit embed to show result
+        # Edit message
         msg = interaction.message
         if msg and msg.embeds:
             base = msg.embeds[0]
@@ -174,11 +175,17 @@ class RatingView(discord.ui.View):
         else:
             await interaction.response.edit_message(view=self)
 
-        await audit(
-            "Ride Rated",
-            [("Rider", f"<@{self.rider_id}>", True), ("Driver", f"<@{self.driver_id}>", True), ("Score", f"{score}/5", True)],
-            color=discord.Color.green()
+        # Post rating log (to rating log channel)
+        log = discord.Embed(
+            title="Ride Rating Submitted",
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc)
         )
+        log.add_field(name="Rider", value=f"<@{self.rider_id}>", inline=True)
+        log.add_field(name="Driver", value=f"<@{self.driver_id}>", inline=True)
+        log.add_field(name="Score", value=f"{score}/5", inline=True)
+        log.add_field(name="Date", value=today_iso(), inline=True)
+        await send_embed(RATING_LOG_CHANNEL_ID, log)
 
     @discord.ui.button(label="1", style=discord.ButtonStyle.secondary, custom_id="rate_1")
     async def r1(self, i: discord.Interaction, _: discord.ui.Button): await self._submit(i, 1)
@@ -397,7 +404,7 @@ async def request_ride(
         view.thread_id = t.id
         intro = discord.Embed(
             title="Ride Thread",
-            description=f"{interaction.user.mention}\nUse this thread to coordinate your pickup and drop-off.",
+            description=f"{interaction.user.mention}\nUse this thread to coordinate your ride.",
             color=discord.Color.dark_grey()
         )
         await t.send(embed=intro)
@@ -688,7 +695,6 @@ async def promote(
 
     await send_embed(PROMOTE_CHANNEL_ID, emb, content=employee.mention, allow_users=True)
 
-    # DM (may fail due to privacy)
     try:
         await employee.send(embed=emb)
     except discord.Forbidden:
@@ -768,14 +774,6 @@ async def on_ready():
     tree.add_command(request_group, guild=guild)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
-
-    started = discord.Embed(
-        title="Lyft Bot Online",
-        description="Bot is up and ready.",
-        color=discord.Color.green(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    await send_embed(AUDIT_LOG_CHANNEL_ID, started)
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 # Web server to serve logo and health
