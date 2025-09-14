@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
-# Full main.py — Lyft Bot (guild-scoped)
-# - /request ride  (with Claim/End, auto LOG on end, rating in thread that updates the LOG)
-# - /log-ride      (TEMPORARILY DISABLED per request — kept in file)
+# Full bot.py — Lyft Bot (guild-scoped)
+# - /request ride  (with Claim/End; auto LOG on End; rating in thread updates LOG)
+# - /log-ride      (TEMPORARILY DISABLED — kept here)
 # - /allocation    (request, reviewers Accept/Deny)
 # - /permission    (request, reviewers Accept/Deny)
-# - /promote       (reviewers only, DM + ping, logo)
-# - /infract       (reviewers only, DM + ping, logo)
-# - /ride start    (in-game rides for drivers; End Ride deletes if no other ongoing; logs as In-Game Ride Log)
+# - /promote       (reviewers only, DM + ping, logo, white lines)
+# - /infract       (reviewers only, DM + ping, logo, white lines)
+# - /ride start    (in-game rides; End deletes if last ongoing; logs; ping driver at top)
 #
-# Notes:
-# * Commands restricted to GUILD_ID.
-# * Driver roles: 1416068902609223749, 1416063969965248594
-# * Ratings are 1..5, logged to 1416772722981339206
-# * Health server runs for Render; serves LYFT.png at /logo.png
+# Environment:
+#   DISCORD_TOKEN
+#
+# Files:
+#   LYFT.png   (logo, same folder)
+#   data.json  (ratings/rides snapshot)
 
 import os, json, asyncio
 from datetime import datetime, timezone
@@ -36,39 +37,35 @@ ROLE_ID_1 = 1416068902609223749
 ROLE_ID_2 = 1416063969965248594
 DRIVER_ROLES = {ROLE_ID_1, ROLE_ID_2}
 
-# Ride request posting channel (Discord riders)
-TARGET_CHANNEL_ID = 1416334665958166560
-
-# In-game rides (external riders)
-INGAME_RIDES_CHANNEL_ID = 1416777579905683557      # dashboards go here (no pings)
-INGAME_RIDE_LOG_CHANNEL_ID = 1416342987893375007   # in-game ride logs on End
-
-# Logs
-AUDIT_LOG_CHANNEL_ID   = 1416392593222270976
-RIDE_LOG_CHANNEL_ID    = 1416342987893375007       # auto logs for /request ride on End
-RATING_LOG_CHANNEL_ID  = 1416772722981339206       # rider ratings go here
-
 # Admin reviewers (can approve/deny and use promote/infract)
 REVIEW_ROLE_1 = 1416069791495622707
 REVIEW_ROLE_2 = 1416069983942869113
 
-# Allocation / Permission request channels
-ALLOCATION_CHANNEL_ID  = 1416425017406914662
-PERMISSION_CHANNEL_ID  = 1416388268894720020
+# Channels
+TARGET_CHANNEL_ID            = 1416334665958166560  # /request ride posts here
+RIDE_LOG_CHANNEL_ID          = 1416342987893375007  # auto log for /request ride on End
+RATING_LOG_CHANNEL_ID        = 1416772722981339206  # ratings log
+AUDIT_LOG_CHANNEL_ID         = 1416392593222270976  # audit
 
-# Promotion / Infraction channels
-PROMOTE_CHANNEL_ID     = 1416423535550791730
-INFRACT_CHANNEL_ID     = 1416423631474655304
+ALLOCATION_CHANNEL_ID        = 1416425017406914662
+PERMISSION_CHANNEL_ID        = 1416388268894720020
+PROMOTE_CHANNEL_ID           = 1416423535550791730
+INFRACT_CHANNEL_ID           = 1416423631474655304
 
-# Static file (logo) served by built-in web server
-LOGO_ROUTE = "/logo.png"
-SEPARATOR  = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
+# In-game rides
+INGAME_RIDES_CHANNEL_ID      = 1416777579905683557  # dashboards (no pings)
+INGAME_RIDE_LOG_CHANNEL_ID   = 1416342987893375007  # logs on End (ping driver at top)
 
-# Data snapshot file
-DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
-
-# Web server port (Render)
+# Render web server
 PORT = int(os.getenv("PORT", "10000"))
+LOGO_ROUTE = "/logo.png"
+LOGO_URL: Optional[str] = None
+
+# UI bits
+SEPARATOR = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
+
+# Data file
+DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
 
 # =========================
 # BOT
@@ -78,7 +75,7 @@ bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
 # =========================
-# JSON "DB" (riders ratings/logs)
+# Lightweight JSON "DB"
 # =========================
 _db_lock = asyncio.Lock()
 _db: Dict[str, Any] = {"riders": {}}
@@ -105,7 +102,7 @@ async def save_db():
         os.replace(tmp, DATA_FILE)
 
 # =========================
-# UTILS
+# Utils
 # =========================
 def today_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -134,7 +131,10 @@ async def send_embed(
 ):
     ch = bot.get_channel(channel_id)
     if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-        return None
+        try:
+            ch = await bot.fetch_channel(channel_id)  # type: ignore
+        except Exception:
+            return None
     return await ch.send(
         content=content or None,
         embed=embed,
@@ -150,14 +150,11 @@ async def audit(title: str, fields: List[tuple], color: discord.Color = discord.
         emb.add_field(name=name, value=value, inline=inline)
     await send_embed(AUDIT_LOG_CHANNEL_ID, emb)
 
-# will be set once web server starts
-LOGO_URL: Optional[str] = None
-
 # =========================
-# RATING VIEW (1..5) — logs to RATING_LOG_CHANNEL_ID and can update a target LOG embed field
+# Rating UI (1..5) — updates the "Rating" field on the LOG embed
 # =========================
 class RatingView(discord.ui.View):
-    def __init__(self, rider_id: int, driver_id: int, log_channel_id: Optional[int] = None, log_message_id: Optional[int] = None):
+    def __init__(self, rider_id: int, driver_id: int, log_channel_id: Optional[int], log_message_id: Optional[int]):
         super().__init__(timeout=600)
         self.rider_id = rider_id
         self.driver_id = driver_id
@@ -187,7 +184,6 @@ class RatingView(discord.ui.View):
             color=discord.Color.green() if score_str != "N/A" else base.color,
             timestamp=datetime.now(timezone.utc)
         )
-        # copy fields but replace Rating if present
         replaced = False
         for f in base.fields:
             if f.name.strip().lower() == "rating":
@@ -216,7 +212,7 @@ class RatingView(discord.ui.View):
         for c in self.children:
             c.disabled = True
 
-        # Save rating in lightweight JSON
+        # Save quick rating snapshot
         async with _db_lock:
             riders = _db.setdefault("riders", {})
             rec = riders.setdefault(str(self.rider_id), {"name": interaction.user.name, "rides": [], "ratings": []})
@@ -228,7 +224,7 @@ class RatingView(discord.ui.View):
             })
         await save_db()
 
-        # Edit the prompt message
+        # Edit the rating prompt
         msg = interaction.message
         if msg and msg.embeds:
             base = msg.embeds[0]
@@ -244,7 +240,7 @@ class RatingView(discord.ui.View):
         else:
             await interaction.response.edit_message(view=self)
 
-        # Update the LOG embed's "Rating" field from N/A -> score
+        # Update the LOG "Rating" field
         await self._update_log_rating_field(f"{score}/5")
 
         # Also log to rating-log channel
@@ -271,7 +267,7 @@ class RatingView(discord.ui.View):
     async def r5(self, i: discord.Interaction, _: discord.ui.Button): await self._submit(i, 5)
 
 # =========================
-# CLAIM / END VIEW for /request ride (Discord riders)
+# Claim/End view for /request ride
 # =========================
 class ClaimView(discord.ui.View):
     def __init__(self, requester_id: int, thread_id: Optional[int] = None):
@@ -280,7 +276,6 @@ class ClaimView(discord.ui.View):
         self.thread_id = thread_id
         self.claimed_by: Optional[int] = None
         self._lock = asyncio.Lock()
-        # Will be set at end_ride time
         self._log_message_id: Optional[int] = None
 
     @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, custom_id="ride_claim")
@@ -305,7 +300,8 @@ class ClaimView(discord.ui.View):
                     timestamp=datetime.now(timezone.utc),
                 )
                 for f in base.fields:
-                    if f.name.strip().lower() in {"driver", "status"}:
+                    nm = f.name.strip().lower()
+                    if nm in {"driver", "status"}:
                         continue
                     new.add_field(name=f.name, value=f.value, inline=f.inline)
                 new.add_field(name="Driver", value=interaction.user.mention, inline=True)
@@ -368,8 +364,7 @@ class ClaimView(discord.ui.View):
             new.set_footer(text="Ride ended")
             await interaction.followup.edit_message(message_id=msg.id, embed=new, view=self)
 
-        # -------- Auto LOG to RIDE_LOG_CHANNEL_ID (ping rider + driver at top) --------
-        # Try to fetch original embed details for pickup/destination/service
+        # Extract details from original embed (if present)
         orig = msg.embeds[0] if msg and msg.embeds else None
         pickup = destination = service = "N/A"
         rider_mention = f"<@{self.requester_id}>"
@@ -380,6 +375,7 @@ class ClaimView(discord.ui.View):
                 elif nm == "destination": destination = f.value
                 elif nm == "service": service = f.value
 
+        # Auto LOG (ping DRIVER ONLY on top)
         log_embed = discord.Embed(
             title="Ride Log",
             description="Ride completed and logged automatically.",
@@ -391,19 +387,18 @@ class ClaimView(discord.ui.View):
         log_embed.add_field(name="Pickup", value=pickup, inline=True)
         log_embed.add_field(name="Destination", value=destination, inline=True)
         log_embed.add_field(name="Service", value=service, inline=True)
-        log_embed.add_field(name="Rating", value="N/A", inline=True)  # will be updated by RatingView
+        log_embed.add_field(name="Rating", value="N/A", inline=True)  # updated later by RatingView
         log_embed.set_footer(text=f"Date: {today_iso()}")
 
         log_msg = await send_embed(
             RIDE_LOG_CHANNEL_ID,
             log_embed,
-            content=f"{rider_mention} {interaction.user.mention}",
+            content=interaction.user.mention,  # ping driver ONLY
             allow_users=True
         )
         self._log_message_id = getattr(log_msg, "id", None)
 
-        # ---------------------------------------------------------------------------
-
+        # Notify channel that ride ended
         ended = discord.Embed(
             title="Ride Completed",
             description=f"Ride ended by {interaction.user.mention}.",
@@ -538,17 +533,17 @@ async def request_ride(
     )
 
 # =========================
-# /log-ride (TEMPORARILY DISABLED — kept for later)
+# /log-ride (TEMP DISABLED)
 # =========================
 @tree.command(name="log-ride", description="Log a completed ride (temporarily disabled)")
 async def log_ride_disabled(interaction: discord.Interaction):
     return await interaction.response.send_message(
-        "This command is temporarily disabled. Ride logs are now posted automatically when the driver ends a ride.",
+        "This command is temporarily disabled. Ride logs are posted automatically when the driver ends a ride.",
         ephemeral=True
     )
 
 # =========================
-# ALLOCATION / PERMISSION with Approve/Deny
+# Approve/Deny view (Allocation/Permission)
 # =========================
 class ApproveDenyView(discord.ui.View):
     def __init__(self, kind: str, requester_id: int):
@@ -716,7 +711,7 @@ async def permission(
     await interaction.followup.send("Permission request sent.", ephemeral=True)
 
 # =========================
-# /promote (reviewers only) with lines + logo + DM + ping on top
+# /promote (reviewers only) — with lines + logo + DM + ping
 # =========================
 @tree.command(name="promote", description="Lyft Promotion record (reviewers only)")
 @app_commands.describe(
@@ -764,7 +759,7 @@ async def promote(
         await audit("Promotion DM Failed", [("Employee", employee.mention, True)], color=discord.Color.red())
 
 # =========================
-# /infract (reviewers only) with lines + logo + DM + ping on top
+# /infract (reviewers only) — with lines + logo + DM + ping
 # =========================
 INFRACTION_CHOICES = [
     app_commands.Choice(name="Notice", value="Notice"),
@@ -827,7 +822,7 @@ async def infract(
         await audit("Infraction DM Failed", [("Employee", employee.mention, True)], color=discord.Color.red())
 
 # =========================
-# /ride start (in-game) for drivers — End Ride deletes if last ongoing; logs (PING DRIVER at top of log)
+# /ride start (in-game) — dashboard + End Ride -> log + delete if last ongoing
 # =========================
 ongoing_message_ids: set[int] = set()
 ongoing_lock = asyncio.Lock()
@@ -865,14 +860,14 @@ class IngameRideView(discord.ui.View):
             if message is None:
                 return
 
-            # Log the ride to INGAME_RIDE_LOG_CHANNEL_ID (ping driver at top)
+            # Log the ride to INGAME_RIDE_LOG_CHANNEL_ID (ping DRIVER only)
             log_channel = interaction.client.get_channel(INGAME_RIDE_LOG_CHANNEL_ID)
             if log_channel is None:
                 try:
                     log_channel = await interaction.client.fetch_channel(INGAME_RIDE_LOG_CHANNEL_ID)
                 except discord.NotFound:
                     log_channel = None
-            
+
             log_embed = discord.Embed(
                 title="In-Game Ride Log",
                 color=discord.Color.dark_grey(),
@@ -889,7 +884,6 @@ class IngameRideView(discord.ui.View):
                 log_embed.add_field(name="Notes", value=self.notes, inline=False)
             log_embed.set_footer(text=f"Date: {today_iso()}")
 
-            # Send the ride log (ping DRIVER only)
             if isinstance(log_channel, (discord.TextChannel, discord.Thread)):
                 await log_channel.send(
                     content=interaction.user.mention,  # ping driver at top
@@ -901,7 +895,6 @@ class IngameRideView(discord.ui.View):
                         replied_user=False
                     ),
                 )
- 
 
             # Track/delete behavior
             async with ongoing_lock:
@@ -1013,7 +1006,7 @@ async def ride_start(
         ongoing_message_ids.add(msg.id)
 
 # =========================
-# READY + SYNC + WEB (serve LYFT.png at /logo.png)
+# Ready + Sync + Web server (serve LYFT.png)
 # =========================
 @bot.event
 async def on_ready():
@@ -1025,7 +1018,6 @@ async def on_ready():
     await tree.sync(guild=guild)
     print(f"Logged in as {bot.user} (ID: {bot.user.id}) — commands synced")
 
-# Web server to serve logo and health
 async def handle_logo(_):
     filepath = os.path.join(os.path.dirname(__file__), "LYFT.png")
     return web.FileResponse(filepath) if os.path.exists(filepath) else web.Response(status=404)
