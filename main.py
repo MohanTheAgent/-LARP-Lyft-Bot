@@ -25,11 +25,11 @@ ROLE_ID_2 = 1416063969965248594  # driver role 2
 # Global audit/activity log
 AUDIT_LOG_CHANNEL_ID = 1416392593222270976
 
-# Heads-up roles to ping for allocation/permission requests
+# Approver roles (can click Accept/Deny on allocation/permission)
 PING_ROLE_ADMIN_1 = 1416069791495622707
 PING_ROLE_ADMIN_2 = 1416069983942869113
 
-# Destination channels for new commands
+# Destination channels for allocation/permission requests
 ALLOCATION_CHANNEL_ID = 1416425017406914662
 PERMISSION_CHANNEL_ID = 1416388268894720020
 
@@ -47,7 +47,7 @@ tree = app_commands.CommandTree(bot)
 # DB (persistent JSON)
 # -----------------------------
 _db_lock = asyncio.Lock()
-_db: Dict[str, Any] = {"riders": {}, "drivers": {}}
+_db: Dict[str, Any] = {"riders": {}}
 
 def today_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -56,16 +56,15 @@ async def load_db():
     global _db
     async with _db_lock:
         if not os.path.exists(DATA_FILE):
-            _db = {"riders": {}, "drivers": {}}
+            _db = {"riders": {}}
             await save_db()
             return
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 _db = json.load(f)
         except Exception:
-            _db = {"riders": {}, "drivers": {}}
+            _db = {"riders": {}}
         _db.setdefault("riders", {})
-        _db.setdefault("drivers", {})
 
 async def save_db():
     async with _db_lock:
@@ -95,10 +94,6 @@ def safe_int(v: str) -> Optional[int]:
     except Exception:
         return None
 
-def avg(values: List[float]) -> Optional[float]:
-    vals = [x for x in values if isinstance(x, (int, float))]
-    return (sum(vals) / len(vals)) if vals else None
-
 def named(user: discord.abc.User) -> str:
     if hasattr(user, "mention"):
         return f"{user.mention} (`{getattr(user, 'id', 'unknown')}`)"
@@ -125,70 +120,7 @@ async def send_audit_embed(
         pass
 
 # -----------------------------
-# Rating buttons (1–5) — thread-based; only rider can press
-# -----------------------------
-class RatingView(discord.ui.View):
-    def __init__(self, driver_id: int, from_user_id: int):
-        super().__init__(timeout=None)
-        self.driver_id = driver_id
-        self.from_user_id = from_user_id
-
-    async def _record(self, interaction: discord.Interaction, value: int):
-        if interaction.user.id != self.from_user_id:
-            return await interaction.response.send_message("Only the rider can rate this ride.", ephemeral=True)
-
-        async with _db_lock:
-            drivers = _db.setdefault("drivers", {})
-            drec = drivers.setdefault(str(self.driver_id), {"name": "", "ratings": []})
-            try:
-                u = interaction.client.get_user(self.driver_id) or await interaction.client.fetch_user(self.driver_id)
-                if u:
-                    drec["name"] = getattr(u, "name", drec.get("name", ""))
-            except Exception:
-                pass
-            drec["ratings"].append({"from": self.from_user_id, "rating": int(value), "date": today_iso()})
-        await save_db()
-
-        for item in self.children:
-            item.disabled = True
-        try:
-            await interaction.response.edit_message(content="Thanks for your feedback!", view=self)
-        except discord.InteractionResponded:
-            await interaction.followup.edit_message(interaction.message.id, content="Thanks for your feedback!", view=self)
-
-        await send_audit_embed(
-            "Rating Submitted",
-            fields=[
-                ("Driver", f"<@{self.driver_id}>", True),
-                ("From", f"<@{self.from_user_id}>", True),
-                ("Rating", f"{value}/5", True),
-                ("Date", today_iso(), True),
-            ],
-            color=discord.Color.green(),
-        )
-
-    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary, row=0, custom_id="rate_1")
-    async def r1(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 1)
-
-    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary, row=0, custom_id="rate_2")
-    async def r2(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 2)
-
-    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, row=0, custom_id="rate_3")
-    async def r3(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 3)
-
-    @discord.ui.button(label="4", style=discord.ButtonStyle.secondary, row=0, custom_id="rate_4")
-    async def r4(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 4)
-
-    @discord.ui.button(label="5", style=discord.ButtonStyle.primary, row=0, custom_id="rate_5")
-    async def r5(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._record(interaction, 5)
-
-# -----------------------------
-# Generic Approvals View (Accept / Deny) for allocation/permission posts
+# Approvals View (Accept / Deny) for allocation/permission posts
 # -----------------------------
 class ApproveDenyView(discord.ui.View):
     def __init__(self, kind: str, requester_id: int):
@@ -241,7 +173,9 @@ class ApproveDenyView(discord.ui.View):
             await interaction.followup.edit_message(message_id=msg.id, embed=new_embed, view=self)
 
         # Notify requester in-channel
-        await msg.channel.send(f"<@{self.requester_id}> Your {self.kind} request was {status_text.lower()} by {interaction.user.mention}")
+        await msg.channel.send(
+            f"<@{self.requester_id}> Your {self.kind} request was {status_text.lower()} by {interaction.user.mention}"
+        )
 
         # Audit
         await send_audit_embed(
@@ -270,7 +204,7 @@ class ApproveDenyView(discord.ui.View):
             await self._finish(interaction, "Denied")
 
 # -----------------------------
-# Claim / End view (stores thread_id to post rating there)
+# Claim / End view (NO rating system)
 # -----------------------------
 class ClaimView(discord.ui.View):
     def __init__(self, requester_id: int, thread_id: Optional[int] = None):
@@ -386,43 +320,7 @@ class ClaimView(discord.ui.View):
             thumbnail_url=getattr(interaction.user.display_avatar, "url", discord.Embed.Empty),
         )
 
-        if self.thread_id:
-            thread = bot.get_channel(self.thread_id)
-            if isinstance(thread, discord.Thread):
-                try:
-                    rating_embed = discord.Embed(
-                        title="Rate Your Driver",
-                        description="Please choose a rating from 1 to 5.",
-                        color=discord.Color.blurple()
-                    )
-                    await thread.send(
-                        content=f"<@{self.requester_id}>",
-                        embed=rating_embed,
-                        view=RatingView(driver_id=self.claimed_by, from_user_id=self.requester_id),
-                        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False)
-                    )
-                    await thread.send(
-                        embed=discord.Embed(
-                            title="Driver Feedback",
-                            description="Please reply in this thread with any comments about your driver.",
-                            color=discord.Color.grayple()
-                        )
-                    )
-                    await send_audit_embed(
-                        "Rating Form Posted",
-                        fields=[
-                            ("Thread", f"<#{self.thread_id}>", True),
-                            ("Rider", f"<@{self.requester_id}>", True),
-                            ("Driver", f"<@{self.claimed_by}>", True),
-                        ],
-                        color=discord.Color.blurple(),
-                    )
-                except Exception as e:
-                    await send_audit_embed(
-                        "Error",
-                        fields=[("Posting rating form failed", str(e), False)],
-                        color=discord.Color.red()
-                    )
+        # (Rating system removed temporarily)
 
 # -----------------------------
 # /request ride
@@ -506,14 +404,13 @@ async def request_ride(
     )
 
 # -----------------------------
-# /log-ride (store to JSON + log to AUDIT channel only)
+# /log-ride (NO rating argument; rating system removed)
 # -----------------------------
 @tree.command(name="log-ride", description="Log a completed ride")
 @app_commands.describe(
     rider="Rider user",
     ride_link="Ride link or reference",
     income="Income for this ride (number)",
-    rating="Your rating for this ride (number 1–5)",
     rides_this_week="Number of rides you completed this week (number)",
     comment="Optional rider comment"
 )
@@ -522,18 +419,18 @@ async def log_ride(
     rider: discord.User,
     ride_link: str,
     income: str,
-    rating: str,
     rides_this_week: str,
     comment: Optional[str] = None
 ):
+    # Fast ack to avoid interaction timeouts
     await interaction.response.send_message("Logging ride...", ephemeral=True)
+
     if interaction.guild_id != GUILD_ID:
         return await interaction.edit_original_response(content="This command is not available in this server.")
     if not user_has_allowed_role(interaction.user):
         return await interaction.edit_original_response(content="You are not authorized to use this command.")
 
     income_val = safe_float(income)
-    rating_val = safe_float(rating)
     rides_val = safe_int(rides_this_week)
 
     async with _db_lock:
@@ -545,12 +442,12 @@ async def log_ride(
             "driver_id": interaction.user.id,
             "driver_name": getattr(interaction.user, "display_name", interaction.user.name),
             "income": income_val if income_val is not None else income,
-            "rating": rating_val if rating_val is not None else rating,
             "comment": (comment or "").strip() or None,
             "ride_link": ride_link
         })
     await save_db()
 
+    # Log to audit channel
     await send_audit_embed(
         "Ride Logged",
         fields=[
@@ -558,7 +455,6 @@ async def log_ride(
             ("Driver", named(interaction.user), True),
             ("Ride Link", ride_link, False),
             ("Income", f"${income_val:,.2f}" if isinstance(income_val, (int, float)) else str(income), True),
-            ("Driver Rating (1–5)", f"{rating_val:.1f}" if isinstance(rating_val, (int, float)) else str(rating), True),
             ("Rides This Week", str(rides_val) if rides_val is not None else rides_this_week, True),
             ("Comment", comment[:1024] if comment else "-", False),
             ("Date", today_iso(), True),
@@ -570,7 +466,7 @@ async def log_ride(
     await interaction.edit_original_response(content="Ride logged.")
 
 # -----------------------------
-# /allocation (with Accept/Deny buttons for approver roles)
+# /allocation (with Approve/Deny)
 # -----------------------------
 @tree.command(name="allocation", description="Submit an allocation request")
 @app_commands.describe(
@@ -641,7 +537,7 @@ async def allocation_request(
     await interaction.followup.send("Allocation request sent.", ephemeral=True)
 
 # -----------------------------
-# /permission (with Accept/Deny buttons for approver roles)
+# /permission (with Approve/Deny)
 # -----------------------------
 @tree.command(name="permission", description="Submit a permission request")
 @app_commands.describe(
