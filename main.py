@@ -41,7 +41,7 @@ LOGO_ROUTE = "/logo.png"
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
-SEPARATOR = "????????????????????"  # provided white line
+SEPARATOR = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"  # exact line you asked for
 
 # =========================
 # BOT
@@ -123,13 +123,7 @@ async def audit(title: str, fields: List[tuple], color: discord.Color = discord.
         emb.add_field(name=name, value=value, inline=inline)
     await send_embed(AUDIT_LOG_CHANNEL_ID, emb)
 
-def logo_url_from_request(request) -> str:
-    # Construct absolute URL to serve LYFT.png
-    scheme = request.scheme if hasattr(request, "scheme") else "https"
-    host = request.host if hasattr(request, "host") else os.getenv("RENDER_EXTERNAL_URL", "http://localhost:10000")
-    return f"{scheme}://{host}{LOGO_ROUTE}"
-
-# Will be set on startup after web server binds
+# will be filled after web server starts
 LOGO_URL: Optional[str] = None
 
 # =========================
@@ -234,7 +228,7 @@ class ClaimView(discord.ui.View):
                         continue
                     new.add_field(name=f.name, value=f.value, inline=f.inline)
                 new.add_field(name="Driver", value=interaction.user.mention, inline=True)
-                new.add_field(name="Status", value="?? Claimed / Ongoing", inline=True)
+                new.add_field(name="Status", value="🟢 Claimed / Ongoing", inline=True)
                 if base.thumbnail and base.thumbnail.url:
                     new.set_thumbnail(url=base.thumbnail.url)
                 new.set_footer(text="Ride claimed")
@@ -284,12 +278,12 @@ class ClaimView(discord.ui.View):
             status_replaced = False
             for f in base.fields:
                 if f.name.strip().lower() == "status":
-                    new.add_field(name="Status", value="?? Completed", inline=True)
+                    new.add_field(name="Status", value="🔴 Completed", inline=True)
                     status_replaced = True
                 else:
                     new.add_field(name=f.name, value=f.value, inline=f.inline)
             if not status_replaced:
-                new.add_field(name="Status", value="?? Completed", inline=True)
+                new.add_field(name="Status", value="🔴 Completed", inline=True)
             new.set_footer(text="Ride ended")
             await interaction.followup.edit_message(message_id=msg.id, embed=new, view=self)
 
@@ -370,13 +364,13 @@ async def request_ride(
     color = discord.Color.orange() if service_level.value == "Premium" else discord.Color.blue()
     e = discord.Embed(
         title=f"{service_level.value} Ride Request",
-        description=f"A new ride is waiting to be claimed.\n{SEPARATOR}",
+        description=f"L y f t  R i d e  R e q u e s t\n{SEPARATOR}",
         color=color,
         timestamp=datetime.now(timezone.utc)
     )
     e.add_field(name="Pickup", value=starting_location, inline=True)
     e.add_field(name="Destination", value=destination, inline=True)
-    e.add_field(name="Status", value="?? Unclaimed", inline=True)
+    e.add_field(name="Status", value="🟡 Unclaimed", inline=True)
     e.add_field(name="Requested By", value=interaction.user.mention, inline=False)
     e.set_thumbnail(url=interaction.user.display_avatar.url)
     e.set_footer(text="Click Claim to accept this ride")
@@ -403,7 +397,7 @@ async def request_ride(
         view.thread_id = t.id
         intro = discord.Embed(
             title="Ride Thread",
-            description=f"{interaction.user.mention} This thread is for coordinating your ride.",
+            description=f"{interaction.user.mention}\nUse this thread to coordinate your pickup and drop-off.",
             color=discord.Color.dark_grey()
         )
         await t.send(embed=intro)
@@ -551,12 +545,12 @@ class ApproveDenyView(discord.ui.View):
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="approve_accept")
     async def approve(self, interaction: discord.Interaction, _: discord.ui.Button):
         if await self._guard(interaction):
-            await self._finish(interaction, "Accepted", "??", discord.Color.green())
+            await self._finish(interaction, "Accepted", "🟢", discord.Color.green())
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="approve_deny")
     async def deny(self, interaction: discord.Interaction, _: discord.ui.Button):
         if await self._guard(interaction):
-            await self._finish(interaction, "Denied", "??", discord.Color.red())
+            await self._finish(interaction, "Denied", "🔴", discord.Color.red())
 
 @tree.command(name="allocation", description="Submit an allocation request")
 @app_commands.describe(
@@ -590,7 +584,7 @@ async def allocation(
     emb.add_field(name="Roles to Give", value=roles_to_give or "-", inline=False)
     emb.add_field(name="Roles to Remove", value=roles_to_remove or "-", inline=False)
     emb.add_field(name="Proof", value=proof or "-", inline=False)
-    emb.add_field(name="Status", value="?? Pending", inline=True)
+    emb.add_field(name="Status", value="🟡 Pending", inline=True)
     emb.add_field(name="Date", value=today_iso(), inline=True)
 
     content = f"<@&{REVIEW_ROLE_1}> <@&{REVIEW_ROLE_2}>"
@@ -636,7 +630,7 @@ async def permission(
     emb.add_field(name="Duration", value=duration or "-", inline=True)
     emb.add_field(name="Reason", value=reason or "-", inline=False)
     emb.add_field(name="Signed", value=signed or "-", inline=True)
-    emb.add_field(name="Status", value="?? Pending", inline=True)
+    emb.add_field(name="Status", value="🟡 Pending", inline=True)
     emb.add_field(name="Date", value=today_iso(), inline=True)
 
     content = f"<@&{REVIEW_ROLE_1}> <@&{REVIEW_ROLE_2}>"
@@ -651,7 +645,7 @@ async def permission(
     await interaction.followup.send("Permission request sent.", ephemeral=True)
 
 # =========================
-# /promote (reviewers only) with logo + DM + ping on top
+# /promote (reviewers only) with exact lines + logo + DM + ping on top
 # =========================
 @tree.command(name="promote", description="Lyft Promotion record (reviewers only)")
 @app_commands.describe(
@@ -678,9 +672,9 @@ async def promote(
 
     desc = (
         "Lyft Promotion Log!\n"
-        f"{SEPARATOR}\n"
-        f"Employee: {employee.mention}\n"
-        f"Old Rank: {old_rank}\n"
+        f"{SEPARATOR}\n\n"
+        f"Employee: {employee.mention}\n\n"
+        f"Old Rank: {old_rank}\n\n"
         f"New Rank: {new_rank}\n"
         f"{SEPARATOR}\n"
         f"Reason: {reason}\n"
@@ -694,13 +688,14 @@ async def promote(
 
     await send_embed(PROMOTE_CHANNEL_ID, emb, content=employee.mention, allow_users=True)
 
+    # DM (may fail due to privacy)
     try:
         await employee.send(embed=emb)
     except discord.Forbidden:
         await audit("Promotion DM Failed", [("Employee", employee.mention, True)], color=discord.Color.red())
 
 # =========================
-# /infract (reviewers only) with logo + DM + ping on top
+# /infract (reviewers only) with exact lines + logo + DM + ping on top
 # =========================
 INFRACTION_CHOICES = [
     app_commands.Choice(name="Notice", value="Notice"),
@@ -742,11 +737,11 @@ async def infract(
 
     desc = (
         "Lyft Infraction Log!\n"
-        f"{SEPARATOR}\n"
-        f"Officer: {interaction.user.mention}\n"
-        f"Reason: {reason}\n"
-        f"Infraction Type: {infraction_type.value}\n"
-        f"Appealable: {appeal_display}\n"
+        f"{SEPARATOR}\n\n"
+        f"Officer: {interaction.user.mention}\n\n"
+        f"Reason: {reason}\n\n"
+        f"Infraction Type: {infraction_type.value}\n\n"
+        f"Appealable: {appeal_display}\n\n"
         f"Proof: {proof or 'N/A'}\n"
         f"Notes: {notes or 'N/A'}\n"
         f"{SEPARATOR}\n"
@@ -785,7 +780,6 @@ async def on_ready():
 
 # Web server to serve logo and health
 async def handle_logo(request):
-    # Ensure LYFT.png exists in the working directory
     filepath = os.path.join(os.path.dirname(__file__), "LYFT.png")
     return web.FileResponse(filepath)
 
@@ -802,7 +796,6 @@ async def start_web_server():
     port = int(os.getenv("PORT", "10000"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    # Set absolute URL once server is up; try to infer from Render
     host = os.getenv("RENDER_EXTERNAL_URL")
     if host:
         if not host.startswith("http"):
