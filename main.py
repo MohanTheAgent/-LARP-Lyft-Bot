@@ -789,7 +789,7 @@ async def infract(
         await audit("Infraction DM Failed", [("Employee", employee.mention, True)], color=discord.Color.red())
 
 # =========================
-# /ride start (in-game) for drivers — End Ride deletes if last ongoing; logs
+# /ride start (in-game) for drivers — End Ride deletes if last ongoing; logs (PING DRIVER at top of log)
 # =========================
 ongoing_message_ids: set[int] = set()
 ongoing_lock = asyncio.Lock()
@@ -827,7 +827,7 @@ class IngameRideView(discord.ui.View):
             if message is None:
                 return
 
-            # Log the ride to INGAME_RIDE_LOG_CHANNEL_ID
+            # Log the ride to INGAME_RIDE_LOG_CHANNEL_ID (ping driver at top)
             log_channel = interaction.client.get_channel(INGAME_RIDE_LOG_CHANNEL_ID)
             if log_channel is None:
                 try:
@@ -853,8 +853,9 @@ class IngameRideView(discord.ui.View):
 
             if isinstance(log_channel, (discord.TextChannel, discord.Thread)):
                 await log_channel.send(
+                    content=interaction.user.mention,  # PING DRIVER AT TOP
                     embed=log_embed,
-                    allowed_mentions=discord.AllowedMentions(roles=False, users=False, everyone=False, replied_user=False),
+                    allowed_mentions=discord.AllowedMentions(roles=False, users=True, everyone=False, replied_user=False),
                 )
 
             # Track/delete behavior
