@@ -535,7 +535,7 @@ async def request_ride(
 # =========================
 # /log-ride (TEMP DISABLED)
 # =========================
-@tree.command(name="log-ride", description="Log a completed ride (temporarily disabled)")
+@tree.command(name="log-ride", description="Disabled Command, logs now get logged automatically. ")
 async def log_ride_disabled(interaction: discord.Interaction):
     return await interaction.response.send_message(
         "This command is temporarily disabled. Ride logs are posted automatically when the driver ends a ride.",
