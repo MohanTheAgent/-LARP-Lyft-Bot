@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
-import os
-import json
-import asyncio
+import os, json, asyncio
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
@@ -16,42 +14,25 @@ load_dotenv()
 # CONFIG
 # -----------------------------
 GUILD_ID = 1416057930381262880
-
-# Ride request posts + roles that are allowed to claim
 TARGET_CHANNEL_ID = 1416334665958166560
-ROLE_ID_1 = 1416068902609223749  # driver role 1 (also allowed to use new commands)
-ROLE_ID_2 = 1416063969965248594  # driver role 2
-
-# Global audit/activity log
+ROLE_ID_1 = 1416068902609223749
+ROLE_ID_2 = 1416063969965248594
+RIDE_LOG_CHANNEL_ID = 1416342987893375007
 AUDIT_LOG_CHANNEL_ID = 1416392593222270976
-
-# Approver roles (can click Accept/Deny on allocation/permission)
-PING_ROLE_ADMIN_1 = 1416069791495622707
-PING_ROLE_ADMIN_2 = 1416069983942869113
-
-# Destination channels for allocation/permission requests
-ALLOCATION_CHANNEL_ID = 1416425017406914662
-PERMISSION_CHANNEL_ID = 1416388268894720020
-
 TOKEN = os.getenv("DISCORD_TOKEN")
+
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
 
-# -----------------------------
-# BOT
-# -----------------------------
 intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
-# -----------------------------
-# DB (persistent JSON)
-# -----------------------------
 _db_lock = asyncio.Lock()
 _db: Dict[str, Any] = {"riders": {}}
 
-def today_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
+# -----------------------------
+# DB
+# -----------------------------
 async def load_db():
     global _db
     async with _db_lock:
@@ -79,132 +60,27 @@ async def save_db():
 def user_has_allowed_role(member: discord.abc.User) -> bool:
     return any(getattr(r, "id", None) in {ROLE_ID_1, ROLE_ID_2} for r in getattr(member, "roles", []))
 
-def is_approver(member: discord.abc.User) -> bool:
-    return any(getattr(r, "id", None) in {PING_ROLE_ADMIN_1, PING_ROLE_ADMIN_2} for r in getattr(member, "roles", []))
-
 def safe_float(v: str) -> Optional[float]:
-    try:
-        return float(v)
-    except Exception:
-        return None
+    try: return float(v)
+    except: return None
 
 def safe_int(v: str) -> Optional[int]:
-    try:
-        return int(v)
-    except Exception:
-        return None
+    try: return int(v)
+    except: return None
 
-def named(user: discord.abc.User) -> str:
-    if hasattr(user, "mention"):
-        return f"{user.mention} (`{getattr(user, 'id', 'unknown')}`)"
-    return f"`{getattr(user, 'id', 'unknown')}`"
+def today_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-async def send_audit_embed(
-    title: str,
-    fields: List[tuple],
-    color: discord.Color = discord.Color.blurple(),
-    description: Optional[str] = None,
-    thumbnail_url: Optional[str] = None,
-):
+async def send_audit_embed(title: str, fields: List[tuple], color=discord.Color.blurple()):
     ch = bot.get_channel(AUDIT_LOG_CHANNEL_ID)
-    if not isinstance(ch, discord.TextChannel):
-        return
-    emb = discord.Embed(title=title, description=description or "", color=color, timestamp=datetime.now(timezone.utc))
+    if not isinstance(ch, discord.TextChannel): return
+    emb = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     for name, value, inline in fields:
         emb.add_field(name=name, value=value, inline=inline)
-    if thumbnail_url:
-        emb.set_thumbnail(url=thumbnail_url)
-    try:
-        await ch.send(embed=emb)
-    except Exception:
-        pass
+    await ch.send(embed=emb)
 
 # -----------------------------
-# Approvals View (Accept / Deny) for allocation/permission posts
-# -----------------------------
-class ApproveDenyView(discord.ui.View):
-    def __init__(self, kind: str, requester_id: int):
-        super().__init__(timeout=None)
-        self.kind = kind  # 'allocation' or 'permission'
-        self.requester_id = requester_id
-        self.finalized = False
-
-    async def _guard(self, interaction: discord.Interaction) -> Optional[bool]:
-        if not is_approver(interaction.user):
-            await interaction.response.send_message("You are not allowed to act on this request.", ephemeral=True)
-            return False
-        if self.finalized:
-            await interaction.response.send_message("This request has already been processed.", ephemeral=True)
-            return False
-        return True
-
-    async def _finish(self, interaction: discord.Interaction, status_text: str):
-        self.finalized = True
-        for c in self.children:
-            c.disabled = True
-
-        # Update embed with Status
-        msg = interaction.message
-        new_embed = None
-        if msg.embeds:
-            base = msg.embeds[0]
-            new = discord.Embed(
-                title=base.title,
-                description=base.description,
-                color=(discord.Color.green() if status_text == "Accepted" else discord.Color.red()),
-                timestamp=datetime.now(timezone.utc),
-            )
-            has_status = False
-            for f in base.fields:
-                if f.name.strip().lower() == "status":
-                    has_status = True
-                    new.add_field(name="Status", value=status_text, inline=True)
-                else:
-                    new.add_field(name=f.name, value=f.value, inline=f.inline)
-            if not has_status:
-                new.add_field(name="Status", value=status_text, inline=True)
-            if base.thumbnail and base.thumbnail.url:
-                new.set_thumbnail(url=base.thumbnail.url)
-            new_embed = new
-
-        try:
-            await interaction.response.edit_message(embed=new_embed, view=self)
-        except discord.InteractionResponded:
-            await interaction.followup.edit_message(message_id=msg.id, embed=new_embed, view=self)
-
-        # Notify requester in-channel
-        await msg.channel.send(
-            f"<@{self.requester_id}> Your {self.kind} request was {status_text.lower()} by {interaction.user.mention}"
-        )
-
-        # Audit
-        await send_audit_embed(
-            f"{self.kind.capitalize()} Request {status_text}",
-            fields=[
-                ("Action By", named(interaction.user), True),
-                ("Requester", f"<@{self.requester_id}>", True),
-                ("Channel", f"<#{msg.channel.id}>", True),
-                ("Message ID", str(msg.id), True),
-                ("Date", today_iso(), True),
-            ],
-            color=(discord.Color.green() if status_text == "Accepted" else discord.Color.red()),
-            thumbnail_url=getattr(interaction.user.display_avatar, "url", discord.Embed.Empty),
-        )
-
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="approve_btn")
-    async def approve(self, interaction: discord.Interaction, _: discord.ui.Button):
-        ok = await self._guard(interaction)
-        if ok:
-            await self._finish(interaction, "Accepted")
-
-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="deny_btn")
-    async def deny(self, interaction: discord.Interaction, _: discord.ui.Button):
-        ok = await self._guard(interaction)
-        if ok:
-            await self._finish(interaction, "Denied")
-
-# -----------------------------
-# Claim / End view (NO rating system)
+# Claim / End view
 # -----------------------------
 class ClaimView(discord.ui.View):
     def __init__(self, requester_id: int, thread_id: Optional[int] = None):
@@ -227,7 +103,6 @@ class ClaimView(discord.ui.View):
             button.disabled = True
 
             msg = interaction.message
-            embed = None
             if msg.embeds:
                 base = msg.embeds[0]
                 new = discord.Embed(
@@ -236,91 +111,58 @@ class ClaimView(discord.ui.View):
                     color=base.color,
                     timestamp=datetime.now(timezone.utc)
                 )
-                has_status = False
                 for f in base.fields:
-                    name_lower = f.name.strip().lower()
-                    if name_lower == "status":
-                        has_status = True
-                        new.add_field(name="Status", value="Claimed / Ongoing", inline=True)
-                    elif name_lower == "driver":
-                        continue
-                    else:
+                    if f.name.lower() != "driver":
                         new.add_field(name=f.name, value=f.value, inline=f.inline)
-                if not has_status:
-                    new.add_field(name="Status", value="Claimed / Ongoing", inline=True)
                 new.add_field(name="Driver", value=interaction.user.mention, inline=False)
-
+                new.add_field(name="Status", value="Claimed / Ongoing", inline=False)
                 if base.thumbnail and base.thumbnail.url:
                     new.set_thumbnail(url=base.thumbnail.url)
                 new.set_footer(text="Ride claimed")
-                embed = new
+                await interaction.followup.edit_message(message_id=msg.id, embed=new, view=self)
 
-            await interaction.followup.edit_message(message_id=msg.id, embed=embed, view=self)
-
+            # EMBED for "Your driver is..."
+            driver_embed = discord.Embed(
+                title="Driver Assigned",
+                description=f"Your driver is {interaction.user.mention}",
+                color=discord.Color.green(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            driver_embed.add_field(name="Rider", value=f"<@{self.requester_id}>", inline=True)
+            driver_embed.add_field(name="Driver", value=interaction.user.mention, inline=True)
             ch = bot.get_channel(TARGET_CHANNEL_ID)
             if isinstance(ch, discord.TextChannel):
-                await ch.send(f"<@{self.requester_id}> Your driver is {interaction.user.mention}")
-
-            await send_audit_embed(
-                "Ride Claimed",
-                fields=[
-                    ("Driver", named(interaction.user), True),
-                    ("Rider", f"<@{self.requester_id}>", True),
-                    ("Date", today_iso(), True),
-                ],
-                color=discord.Color.orange(),
-                thumbnail_url=getattr(interaction.user.display_avatar, "url", discord.Embed.Empty),
-            )
+                await ch.send(
+                    content=f"<@{self.requester_id}>",
+                    embed=driver_embed,
+                    allowed_mentions=discord.AllowedMentions(users=True)
+                )
+            await send_audit_embed("Ride Claimed", [("Rider", f"<@{self.requester_id}>", True), ("Driver", interaction.user.mention, True)], discord.Color.orange())
 
     @discord.ui.button(label="End Ride", style=discord.ButtonStyle.danger, custom_id="end_btn")
-    async def end_ride(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def end(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         if self.claimed_by is None:
-            return await interaction.followup.send("This ride has not been claimed yet.", ephemeral=True)
+            return await interaction.followup.send("No driver has claimed this ride yet.", ephemeral=True)
         if interaction.user.id != self.claimed_by:
             return await interaction.followup.send("Only the driver who claimed this ride can end it.", ephemeral=True)
 
         button.disabled = True
-
         msg = interaction.message
-        embed = None
         if msg.embeds:
             base = msg.embeds[0]
-            new = discord.Embed(
+            ended = discord.Embed(
                 title=base.title,
                 description=base.description,
                 color=discord.Color.dark_grey(),
                 timestamp=datetime.now(timezone.utc)
             )
-            has_status = False
             for f in base.fields:
-                if f.name.strip().lower() == "status":
-                    has_status = True
-                    new.add_field(name="Status", value="Completed", inline=True)
-                else:
-                    new.add_field(name=f.name, value=f.value, inline=f.inline)
-            if not has_status:
-                new.add_field(name="Status", value="Completed", inline=True)
-            new.set_footer(text="Ride ended")
-            embed = new
-        await interaction.followup.edit_message(message_id=msg.id, embed=embed, view=self)
+                ended.add_field(name=f.name, value=f.value, inline=f.inline)
+            ended.set_footer(text="Ride ended")
+            await interaction.followup.edit_message(message_id=msg.id, embed=ended, view=self)
 
-        ch = bot.get_channel(TARGET_CHANNEL_ID)
-        if isinstance(ch, discord.TextChannel):
-            await ch.send(f"-# Ride ended by {interaction.user.mention}")
-
-        await send_audit_embed(
-            "Ride Ended",
-            fields=[
-                ("Driver", named(interaction.user), True),
-                ("Rider", f"<@{self.requester_id}>", True),
-                ("Date", today_iso(), True),
-            ],
-            color=discord.Color.dark_grey(),
-            thumbnail_url=getattr(interaction.user.display_avatar, "url", discord.Embed.Empty),
-        )
-
-        # (Rating system removed temporarily)
+        await send_audit_embed("Ride Ended", [("Rider", f"<@{self.requester_id}>", True), ("Driver", interaction.user.mention, True)], discord.Color.dark_grey())
 
 # -----------------------------
 # /request ride
@@ -328,83 +170,41 @@ class ClaimView(discord.ui.View):
 request_group = app_commands.Group(name="request", description="Create ride requests")
 
 @app_commands.choices(
-    service_level=[app_commands.Choice(name="Premium", value="Premium"),
-                   app_commands.Choice(name="Standard", value="Standard")]
+    service_level=[app_commands.Choice(name="Premium", value="Premium"), app_commands.Choice(name="Standard", value="Standard")]
 )
 @request_group.command(name="ride", description="Request a ride")
-@app_commands.describe(
-    starting_location="Pickup location",
-    destination="Destination",
-    service_level="Premium or Standard"
-)
-async def request_ride(
-    interaction: discord.Interaction,
-    starting_location: str,
-    destination: str,
-    service_level: app_commands.Choice[str]
-):
+@app_commands.describe(starting_location="Pickup location", destination="Destination", service_level="Premium or Standard")
+async def request_ride(interaction: discord.Interaction, starting_location: str, destination: str, service_level: app_commands.Choice[str]):
     await interaction.response.send_message("Posting your ride...", ephemeral=True)
-    if interaction.guild_id != GUILD_ID:
-        return await interaction.edit_original_response(content="This command is not available in this server.")
 
-    color = discord.Color.orange() if service_level.value == "Premium" else discord.Color.blue()
     separator = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
-
     e = discord.Embed(
         title=f"{service_level.value} Ride Request",
         description=f"A new ride is waiting to be claimed.\n{separator}",
-        color=color,
+        color=discord.Color.orange() if service_level.value == "Premium" else discord.Color.blue(),
         timestamp=datetime.now(timezone.utc)
     )
     e.add_field(name="Pickup", value=starting_location, inline=True)
     e.add_field(name="Destination", value=destination, inline=True)
-    e.add_field(name="Status", value="Unclaimed", inline=True)
     e.add_field(name="Requested By", value=interaction.user.mention, inline=False)
     e.set_thumbnail(url=interaction.user.display_avatar.url)
-    e.set_footer(text="Click Claim to accept this ride")
 
-    view = ClaimView(requester_id=interaction.user.id, thread_id=None)
-
+    v = ClaimView(requester_id=interaction.user.id)
     ch = bot.get_channel(TARGET_CHANNEL_ID)
-    if ch is None:
-        try:
-            ch = await bot.fetch_channel(TARGET_CHANNEL_ID)
-        except discord.NotFound:
-            return await interaction.edit_original_response(content="Ride channel not found.")
-
-    content = f"<@&{ROLE_ID_1}> <@&{ROLE_ID_2}>"
-    msg = await ch.send(content=content, embed=e, view=view, allowed_mentions=discord.AllowedMentions(roles=True))
-
-    try:
-        t = await msg.create_thread(name=f"Ride - {interaction.user.display_name}", auto_archive_duration=1440)
-        view.thread_id = t.id
-        await t.send(
-            embed=discord.Embed(
-                title="Ride Thread",
-                description=f"{interaction.user.mention} This thread is for coordinating your ride.",
-                color=discord.Color.dark_theme()
-            )
-        )
-    except Exception:
-        pass
-
-    await interaction.edit_original_response(content="Your ride has been posted.")
-    await send_audit_embed(
-        "Ride Requested",
-        fields=[
-            ("Rider", named(interaction.user), True),
-            ("Pickup", starting_location, True),
-            ("Destination", destination, True),
-            ("Service", service_level.value, True),
-            ("Status", "Unclaimed", True),
-            ("Date", today_iso(), True),
-        ],
-        color=color,
-        thumbnail_url=getattr(interaction.user.display_avatar, "url", discord.Embed.Empty),
+    msg = await ch.send(
+        content=f"<@&{ROLE_ID_1}> <@&{ROLE_ID_2}>",
+        embed=e,
+        view=v,
+        allowed_mentions=discord.AllowedMentions(roles=True)
     )
+    thread = await msg.create_thread(name=f"Ride - {interaction.user.display_name}", auto_archive_duration=1440)
+    v.thread_id = thread.id
+    await thread.send(embed=discord.Embed(description=f"{interaction.user.mention} This thread is for this ride.", color=discord.Color.dark_grey()))
+    await interaction.edit_original_response(content="Ride posted successfully.")
+    await send_audit_embed("Ride Requested", [("Rider", interaction.user.mention, True), ("Pickup", starting_location, True), ("Destination", destination, True)])
 
 # -----------------------------
-# /log-ride (NO rating argument; rating system removed)
+# /log-ride
 # -----------------------------
 @tree.command(name="log-ride", description="Log a completed ride")
 @app_commands.describe(
@@ -422,11 +222,7 @@ async def log_ride(
     rides_this_week: str,
     comment: Optional[str] = None
 ):
-    # Fast ack to avoid interaction timeouts
     await interaction.response.send_message("Logging ride...", ephemeral=True)
-
-    if interaction.guild_id != GUILD_ID:
-        return await interaction.edit_original_response(content="This command is not available in this server.")
     if not user_has_allowed_role(interaction.user):
         return await interaction.edit_original_response(content="You are not authorized to use this command.")
 
@@ -442,173 +238,35 @@ async def log_ride(
             "driver_id": interaction.user.id,
             "driver_name": getattr(interaction.user, "display_name", interaction.user.name),
             "income": income_val if income_val is not None else income,
+            "rides_this_week": rides_val if rides_val is not None else rides_this_week,
             "comment": (comment or "").strip() or None,
             "ride_link": ride_link
         })
     await save_db()
 
-    # Log to audit channel
-    await send_audit_embed(
-        "Ride Logged",
-        fields=[
-            ("Rider", named(rider), True),
-            ("Driver", named(interaction.user), True),
-            ("Ride Link", ride_link, False),
-            ("Income", f"${income_val:,.2f}" if isinstance(income_val, (int, float)) else str(income), True),
-            ("Rides This Week", str(rides_val) if rides_val is not None else rides_this_week, True),
-            ("Comment", comment[:1024] if comment else "-", False),
-            ("Date", today_iso(), True),
-        ],
+    log_embed = discord.Embed(
+        title="📋 Ride Logged",
         color=discord.Color.dark_grey(),
-        thumbnail_url=getattr(rider.display_avatar, "url", discord.Embed.Empty),
+        timestamp=datetime.now(timezone.utc)
     )
+    log_embed.add_field(name="Rider", value=rider.mention, inline=True)
+    log_embed.add_field(name="Driver", value=interaction.user.mention, inline=True)
+    log_embed.add_field(name="Ride Link", value=ride_link, inline=False)
+    log_embed.add_field(name="Income", value=f"${income_val:,.2f}" if income_val else income, inline=True)
+    log_embed.add_field(name="Rides This Week", value=str(rides_val) if rides_val else rides_this_week, inline=True)
+    log_embed.add_field(name="Comment", value=comment or "No comment provided", inline=False)
+    log_embed.set_thumbnail(url=rider.display_avatar.url)
+    log_embed.set_footer(text=f"Logged on {today_iso()}")
 
-    await interaction.edit_original_response(content="Ride logged.")
+    ch = bot.get_channel(RIDE_LOG_CHANNEL_ID)
+    if isinstance(ch, discord.TextChannel):
+        await ch.send(embed=log_embed)
+
+    await interaction.edit_original_response(content="Ride logged successfully.")
+    await send_audit_embed("Ride Logged", [("Rider", rider.mention, True), ("Driver", interaction.user.mention, True)], discord.Color.dark_grey())
 
 # -----------------------------
-# /allocation (with Approve/Deny)
-# -----------------------------
-@tree.command(name="allocation", description="Submit an allocation request")
-@app_commands.describe(
-    role_recipient="User who will receive role changes",
-    roles_to_give="Role(s) to be given (names or IDs, comma separated)",
-    roles_to_remove="Role(s) to be removed (names or IDs, comma separated)",
-    proof="Proof (URL or description)"
-)
-async def allocation_request(
-    interaction: discord.Interaction,
-    role_recipient: discord.User,
-    roles_to_give: str,
-    roles_to_remove: str,
-    proof: str
-):
-    if interaction.guild_id != GUILD_ID:
-        return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
-    if not any(getattr(r, "id", None) == ROLE_ID_1 for r in getattr(interaction.user, "roles", [])):
-        return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
-
-    await interaction.response.send_message("Submitting allocation request...", ephemeral=True)
-
-    ch = bot.get_channel(ALLOCATION_CHANNEL_ID)
-    if not isinstance(ch, discord.TextChannel):
-        return await interaction.followup.send("Allocation channel not found.", ephemeral=True)
-
-    emb = discord.Embed(
-        title="Allocation Request",
-        color=discord.Color.dark_teal(),
-        timestamp=datetime.now(timezone.utc),
-        description="A driver has submitted an allocation request for review."
-    )
-    emb.add_field(name="Requested By", value=named(interaction.user), inline=True)
-    emb.add_field(name="Recipient", value=named(role_recipient), inline=True)
-    emb.add_field(name="Roles to Give", value=roles_to_give or "-", inline=False)
-    emb.add_field(name="Roles to Remove", value=roles_to_remove or "-", inline=False)
-    emb.add_field(name="Proof", value=proof or "-", inline=False)
-    emb.add_field(name="Date", value=today_iso(), inline=True)
-    emb.add_field(name="Status", value="Pending", inline=True)
-    try:
-        emb.set_thumbnail(url=role_recipient.display_avatar.url)
-    except Exception:
-        pass
-
-    content = f"<@&{PING_ROLE_ADMIN_1}> <@&{PING_ROLE_ADMIN_2}>"
-    view = ApproveDenyView(kind="allocation", requester_id=interaction.user.id)
-    await ch.send(
-        content=content,
-        embed=emb,
-        view=view,
-        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
-    )
-
-    await send_audit_embed(
-        "Allocation Request Logged",
-        fields=[
-            ("By", named(interaction.user), True),
-            ("Recipient", named(role_recipient), True),
-            ("Give", roles_to_give or "-", False),
-            ("Remove", roles_to_remove or "-", False),
-            ("Proof", (proof or "-")[:512], False),
-            ("Date", today_iso(), True),
-        ],
-        color=discord.Color.dark_teal(),
-        thumbnail_url=getattr(role_recipient.display_avatar, "url", discord.Embed.Empty),
-    )
-
-    await interaction.followup.send("Allocation request sent.", ephemeral=True)
-
-# -----------------------------
-# /permission (with Approve/Deny)
-# -----------------------------
-@tree.command(name="permission", description="Submit a permission request")
-@app_commands.describe(
-    permission="Permission requested",
-    duration="Requested duration",
-    reason="Reason for the permission",
-    signed="Your signature (name/ID)"
-)
-async def permission_request(
-    interaction: discord.Interaction,
-    permission: str,
-    duration: str,
-    reason: str,
-    signed: str
-):
-    if interaction.guild_id != GUILD_ID:
-        return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
-    if not any(getattr(r, "id", None) == ROLE_ID_1 for r in getattr(interaction.user, "roles", [])):
-        return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
-
-    await interaction.response.send_message("Submitting permission request...", ephemeral=True)
-
-    ch = bot.get_channel(PERMISSION_CHANNEL_ID)
-    if not isinstance(ch, discord.TextChannel):
-        return await interaction.followup.send("Permission channel not found.", ephemeral=True)
-
-    emb = discord.Embed(
-        title="Permission Request",
-        color=discord.Color.dark_gold(),
-        timestamp=datetime.now(timezone.utc),
-        description="A driver has submitted a permission request for approval."
-    )
-    emb.add_field(name="Requested By", value=named(interaction.user), inline=True)
-    emb.add_field(name="Permission", value=permission or "-", inline=False)
-    emb.add_field(name="Duration", value=duration or "-", inline=True)
-    emb.add_field(name="Reason", value=reason or "-", inline=False)
-    emb.add_field(name="Signed", value=signed or "-", inline=True)
-    emb.add_field(name="Date", value=today_iso(), inline=True)
-    emb.add_field(name="Status", value="Pending", inline=True)
-    try:
-        emb.set_thumbnail(url=interaction.user.display_avatar.url)
-    except Exception:
-        pass
-
-    content = f"<@&{PING_ROLE_ADMIN_1}> <@&{PING_ROLE_ADMIN_2}>"
-    view = ApproveDenyView(kind="permission", requester_id=interaction.user.id)
-    await ch.send(
-        content=content,
-        embed=emb,
-        view=view,
-        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
-    )
-
-    await send_audit_embed(
-        "Permission Request Logged",
-        fields=[
-            ("By", named(interaction.user), True),
-            ("Permission", permission or "-", False),
-            ("Duration", duration or "-", True),
-            ("Reason", (reason or "-")[:512], False),
-            ("Signed", signed or "-", True),
-            ("Date", today_iso(), True),
-        ],
-        color=discord.Color.dark_gold(),
-        thumbnail_url=getattr(interaction.user.display_avatar, "url", discord.Embed.Empty),
-    )
-
-    await interaction.followup.send("Permission request sent.", ephemeral=True)
-
-# -----------------------------
-# Ready / sync
+# READY + webserver
 # -----------------------------
 @bot.event
 async def on_ready():
@@ -617,44 +275,16 @@ async def on_ready():
     tree.add_command(request_group, guild=guild)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
+    await send_audit_embed("Lyft Bot Online", [("Bot", bot.user.mention, True)], discord.Color.green())
 
-    g = bot.get_guild(GUILD_ID)
-    member_count = g.member_count if g else "—"
-    await send_audit_embed(
-        "Lyft Bot Online",
-        fields=[
-            ("Bot", named(bot.user), True),
-            ("Guild", f"{getattr(g, 'name', 'Unknown')} (`{GUILD_ID}`)", True),
-            ("Members", str(member_count), True),
-            ("Commands Synced", "Yes", True),
-        ],
-        color=discord.Color.green(),
-        thumbnail_url=getattr(bot.user.display_avatar, "url", discord.Embed.Empty),
-    )
+async def health(_): return web.Response(text="OK")
+async def webserver():
+    a = web.Application(); a.router.add_get("/", health); a.router.add_get("/health", health)
+    r = web.AppRunner(a); await r.setup()
+    await web.TCPSite(r, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
 
-# -----------------------------
-# Minimal HTTP server (Render)
-# -----------------------------
-async def handle_health(_):
-    return web.Response(text="OK")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_health)
-    app.router.add_get("/health", handle_health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", "10000"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-# -----------------------------
-# MAIN
-# -----------------------------
 async def main():
-    if not TOKEN:
-        raise RuntimeError("Please set DISCORD_TOKEN env var.")
-    await start_web_server()
+    await webserver()
     await bot.start(TOKEN)
 
 if __name__ == "__main__":
