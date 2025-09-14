@@ -17,7 +17,7 @@ GUILD_ID = 1416057930381262880
 
 # Ride posting + driver roles
 TARGET_CHANNEL_ID = 1416334665958166560
-ROLE_ID_1 = 1416068902609223749   # driver role 1 (can claim, can use /allocation & /permission)
+ROLE_ID_1 = 1416068902609223749   # driver role 1 (can claim; can submit allocation/permission)
 ROLE_ID_2 = 1416063969965248594   # driver role 2 (can claim)
 
 # Logs
@@ -89,12 +89,13 @@ def safe_int(v: str) -> Optional[int]:
     try: return int(v)
     except: return None
 
-async def send_embed(channel_id: int, embed: discord.Embed, content: Optional[str] = None, allow_roles=False, allow_users=False):
+async def send_embed(channel_id: int, embed: discord.Embed, content: Optional[str] = None, allow_roles=False, allow_users=False, view: Optional[discord.ui.View]=None):
     ch = bot.get_channel(channel_id)
-    if not isinstance(ch, discord.TextChannel): return
-    await ch.send(
+    if not isinstance(ch, discord.TextChannel): return None
+    return await ch.send(
         content=content or None,
         embed=embed,
+        view=view,
         allowed_mentions=discord.AllowedMentions(
             roles=allow_roles, users=allow_users, everyone=False, replied_user=False
         )
@@ -141,17 +142,12 @@ class ClaimView(discord.ui.View):
                     timestamp=datetime.now(timezone.utc),
                 )
                 # Keep existing fields except Driver/Status, then add them fresh
-                has_status = False
                 for f in base.fields:
-                    n = f.name.strip().lower()
-                    if n in {"driver", "status"}: 
+                    if f.name.strip().lower() in {"driver", "status"}:
                         continue
-                    if n == "requested by":  # keep requested by
-                        new.add_field(name=f.name, value=f.value, inline=f.inline)
-                    else:
-                        new.add_field(name=f.name, value=f.value, inline=f.inline)
+                    new.add_field(name=f.name, value=f.value, inline=f.inline)
                 new.add_field(name="Driver", value=interaction.user.mention, inline=True)
-                new.add_field(name="Status", value="Claimed / Ongoing", inline=True)
+                new.add_field(name="Status", value="🟢 Claimed / Ongoing", inline=True)
                 if base.thumbnail and base.thumbnail.url:
                     new.set_thumbnail(url=base.thumbnail.url)
                 new.set_footer(text="Ride claimed")
@@ -199,15 +195,16 @@ class ClaimView(discord.ui.View):
                 color=discord.Color.dark_grey(),
                 timestamp=datetime.now(timezone.utc),
             )
-            has_status = False
+            # Copy fields but replace Status
+            status_replaced = False
             for f in base.fields:
                 if f.name.strip().lower() == "status":
-                    has_status = True
-                    new.add_field(name="Status", value="Completed", inline=True)
+                    new.add_field(name="Status", value="🔴 Completed", inline=True)
+                    status_replaced = True
                 else:
                     new.add_field(name=f.name, value=f.value, inline=f.inline)
-            if not has_status:
-                new.add_field(name="Status", value="Completed", inline=True)
+            if not status_replaced:
+                new.add_field(name="Status", value="🔴 Completed", inline=True)
             new.set_footer(text="Ride ended")
             await interaction.followup.edit_message(message_id=msg.id, embed=new, view=self)
 
@@ -229,7 +226,7 @@ class ClaimView(discord.ui.View):
         )
 
 class ApproveDenyView(discord.ui.View):
-    """Accept/Deny for allocation/permission. Only reviewers can click."""
+    """Accept/Deny for allocation/permission. Only reviewers can click and it updates Status with emoji."""
     def __init__(self, kind: str, requester_id: int):
         super().__init__(timeout=None)
         self.kind = kind  # 'allocation' | 'permission'
@@ -245,29 +242,29 @@ class ApproveDenyView(discord.ui.View):
             return False
         return True
 
-    async def _finish(self, interaction: discord.Interaction, decision: str):
+    async def _finish(self, interaction: discord.Interaction, decision: str, symbol: str, color: discord.Color):
         self.finalized = True
         for c in self.children: c.disabled = True
 
-        # Update original embed with Status
+        # Update original embed with Status (with emoji)
         msg = interaction.message
         if msg.embeds:
             base = msg.embeds[0]
             new = discord.Embed(
                 title=base.title,
                 description=base.description,
-                color=discord.Color.green() if decision == "Accepted" else discord.Color.red(),
+                color=color,
                 timestamp=datetime.now(timezone.utc)
             )
-            has_status = False
+            had_status = False
             for f in base.fields:
                 if f.name.strip().lower() == "status":
-                    has_status = True
-                    new.add_field(name="Status", value=decision, inline=True)
+                    had_status = True
+                    new.add_field(name="Status", value=f"{symbol} {decision}", inline=True)
                 else:
                     new.add_field(name=f.name, value=f.value, inline=f.inline)
-            if not has_status:
-                new.add_field(name="Status", value=decision, inline=True)
+            if not had_status:
+                new.add_field(name="Status", value=f"{symbol} {decision}", inline=True)
             if base.thumbnail and base.thumbnail.url:
                 new.set_thumbnail(url=base.thumbnail.url)
 
@@ -280,7 +277,7 @@ class ApproveDenyView(discord.ui.View):
         dec = discord.Embed(
             title=f"{self.kind.capitalize()} Request {decision}",
             description=f"{self.kind.capitalize()} request was {decision.lower()} by {interaction.user.mention}.",
-            color=discord.Color.green() if decision == "Accepted" else discord.Color.red(),
+            color=color,
             timestamp=datetime.now(timezone.utc)
         )
         dec.add_field(name="Requester", value=f"<@{self.requester_id}>", inline=True)
@@ -294,18 +291,18 @@ class ApproveDenyView(discord.ui.View):
         await audit(
             f"{self.kind.capitalize()} Request {decision}",
             [("Requester", f"<@{self.requester_id}>", True), ("Reviewed By", interaction.user.mention, True)],
-            color=discord.Color.green() if decision == "Accepted" else discord.Color.red()
+            color=color
         )
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="approve_accept")
     async def approve(self, interaction: discord.Interaction, _: discord.ui.Button):
         if await self._guard(interaction):
-            await self._finish(interaction, "Accepted")
+            await self._finish(interaction, "Accepted", "🟢", discord.Color.green())
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="approve_deny")
     async def deny(self, interaction: discord.Interaction, _: discord.ui.Button):
         if await self._guard(interaction):
-            await self._finish(interaction, "Denied")
+            await self._finish(interaction, "Denied", "🔴", discord.Color.red())
 
 # =========================
 # /REQUEST ride
@@ -340,6 +337,7 @@ async def request_ride(
     )
     e.add_field(name="Pickup", value=starting_location, inline=True)
     e.add_field(name="Destination", value=destination, inline=True)
+    e.add_field(name="Status", value="🟡 Unclaimed", inline=True)
     e.add_field(name="Requested By", value=interaction.user.mention, inline=False)
     e.set_thumbnail(url=interaction.user.display_avatar.url)
     e.set_footer(text="Click Claim to accept this ride")
@@ -448,7 +446,7 @@ async def log_ride(
     await audit("Ride Logged", [("Rider", rider.mention, True), ("Driver", interaction.user.mention, True)], color=discord.Color.dark_grey())
 
 # =========================
-# /ALLOCATION  (reviewed with Accept/Deny)
+# /ALLOCATION  (reviewed with Accept/Deny; status shows 🟡/🟢/🔴)
 # =========================
 @tree.command(name="allocation", description="Submit an allocation request")
 @app_commands.describe(
@@ -482,25 +480,21 @@ async def allocation(
     emb.add_field(name="Roles to Give", value=roles_to_give or "—", inline=False)
     emb.add_field(name="Roles to Remove", value=roles_to_remove or "—", inline=False)
     emb.add_field(name="Proof", value=proof or "—", inline=False)
-    emb.add_field(name="Status", value="Pending", inline=True)
+    emb.add_field(name="Status", value="🟡 Pending", inline=True)
     emb.add_field(name="Date", value=today_iso(), inline=True)
     emb.set_thumbnail(url=role_recipient.display_avatar.url)
 
     content = f"<@&{PING_ROLE_ADMIN_1}> <@&{PING_ROLE_ADMIN_2}>"
     view = ApproveDenyView(kind="allocation", requester_id=interaction.user.id)
+
+    # Send one message with embed+view so the buttons can edit the same message
     await send_embed(
         ALLOCATION_CHANNEL_ID,
         emb,
         content=content,
-        allow_roles=True
+        allow_roles=True,
+        view=view
     )
-
-    # Also drop the interactive view (needs channel object)
-    ch = bot.get_channel(ALLOCATION_CHANNEL_ID)
-    if isinstance(ch, discord.TextChannel):
-        await ch.send(
-            view=view
-        )
 
     await audit(
         "Allocation Request Logged",
@@ -510,7 +504,7 @@ async def allocation(
     await interaction.followup.send("Allocation request sent.", ephemeral=True)
 
 # =========================
-# /PERMISSION  (reviewed with Accept/Deny)
+# /PERMISSION  (reviewed with Accept/Deny; status shows 🟡/🟢/🔴)
 # =========================
 @tree.command(name="permission", description="Submit a permission request")
 @app_commands.describe(
@@ -544,22 +538,20 @@ async def permission(
     emb.add_field(name="Duration", value=duration or "—", inline=True)
     emb.add_field(name="Reason", value=reason or "—", inline=False)
     emb.add_field(name="Signed", value=signed or "—", inline=True)
-    emb.add_field(name="Status", value="Pending", inline=True)
+    emb.add_field(name="Status", value="🟡 Pending", inline=True)
     emb.add_field(name="Date", value=today_iso(), inline=True)
     emb.set_thumbnail(url=interaction.user.display_avatar.url)
 
     content = f"<@&{PING_ROLE_ADMIN_1}> <@&{PING_ROLE_ADMIN_2}>"
     view = ApproveDenyView(kind="permission", requester_id=interaction.user.id)
+
     await send_embed(
         PERMISSION_CHANNEL_ID,
         emb,
         content=content,
-        allow_roles=True
+        allow_roles=True,
+        view=view
     )
-
-    ch = bot.get_channel(PERMISSION_CHANNEL_ID)
-    if isinstance(ch, discord.TextChannel):
-        await ch.send(view=view)
 
     await audit(
         "Permission Request Logged",
@@ -585,7 +577,6 @@ async def on_ready():
         color=discord.Color.green(),
         timestamp=datetime.now(timezone.utc)
     )
-    started.add_field(name="Guild", value=str(GUILD_ID), inline=True)
     await send_embed(AUDIT_LOG_CHANNEL_ID, started)
 
 async def health(_): return web.Response(text="OK")
@@ -600,8 +591,7 @@ async def webserver():
     await site.start()
 
 async def main():
-    if not TOKEN:
-        raise RuntimeError("Please set DISCORD_TOKEN env var.")
+    if not TOKEN: raise RuntimeError("Missing DISCORD_TOKEN")
     await webserver()
     await bot.start(TOKEN)
 
