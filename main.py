@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Full main.py — Lyft Bot (guild-scoped)
-# - /request ride  (with Claim/End + rating in thread, role pings)
-# - /log-ride      (logs a completed ride)
+# - /request ride  (with Claim/End, auto LOG on end, rating in thread that updates the LOG)
+# - /log-ride      (TEMPORARILY DISABLED per request — kept in file)
 # - /allocation    (request, reviewers Accept/Deny)
 # - /permission    (request, reviewers Accept/Deny)
 # - /promote       (reviewers only, DM + ping, logo)
@@ -45,7 +45,7 @@ INGAME_RIDE_LOG_CHANNEL_ID = 1416342987893375007   # in-game ride logs on End
 
 # Logs
 AUDIT_LOG_CHANNEL_ID   = 1416392593222270976
-RIDE_LOG_CHANNEL_ID    = 1416342987893375007       # /log-ride logs here
+RIDE_LOG_CHANNEL_ID    = 1416342987893375007       # auto logs for /request ride on End
 RATING_LOG_CHANNEL_ID  = 1416772722981339206       # rider ratings go here
 
 # Admin reviewers (can approve/deny and use promote/infract)
@@ -154,14 +154,57 @@ async def audit(title: str, fields: List[tuple], color: discord.Color = discord.
 LOGO_URL: Optional[str] = None
 
 # =========================
-# RATING VIEW (1..5) — logs to RATING_LOG_CHANNEL_ID
+# RATING VIEW (1..5) — logs to RATING_LOG_CHANNEL_ID and can update a target LOG embed field
 # =========================
 class RatingView(discord.ui.View):
-    def __init__(self, rider_id: int, driver_id: int):
+    def __init__(self, rider_id: int, driver_id: int, log_channel_id: Optional[int] = None, log_message_id: Optional[int] = None):
         super().__init__(timeout=600)
         self.rider_id = rider_id
         self.driver_id = driver_id
+        self.log_channel_id = log_channel_id
+        self.log_message_id = log_message_id
         self.submitted = False
+
+    async def _update_log_rating_field(self, score_str: str):
+        if not (self.log_channel_id and self.log_message_id):
+            return
+        ch = bot.get_channel(self.log_channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            try:
+                ch = await bot.fetch_channel(self.log_channel_id)  # type: ignore
+            except Exception:
+                return
+        try:
+            msg = await ch.fetch_message(self.log_message_id)  # type: ignore
+        except Exception:
+            return
+        if not msg.embeds:
+            return
+        base = msg.embeds[0]
+        new = discord.Embed(
+            title=base.title,
+            description=base.description,
+            color=discord.Color.green() if score_str != "N/A" else base.color,
+            timestamp=datetime.now(timezone.utc)
+        )
+        # copy fields but replace Rating if present
+        replaced = False
+        for f in base.fields:
+            if f.name.strip().lower() == "rating":
+                new.add_field(name="Rating", value=score_str, inline=True)
+                replaced = True
+            else:
+                new.add_field(name=f.name, value=f.value, inline=f.inline)
+        if not replaced:
+            new.add_field(name="Rating", value=score_str, inline=True)
+        if base.thumbnail and base.thumbnail.url:
+            new.set_thumbnail(url=base.thumbnail.url)
+        if base.footer and base.footer.text:
+            new.set_footer(text=base.footer.text)
+        try:
+            await msg.edit(embed=new)
+        except Exception:
+            pass
 
     async def _submit(self, interaction: discord.Interaction, score: int):
         if interaction.user.id != self.rider_id:
@@ -173,7 +216,7 @@ class RatingView(discord.ui.View):
         for c in self.children:
             c.disabled = True
 
-        # Save rating
+        # Save rating in lightweight JSON
         async with _db_lock:
             riders = _db.setdefault("riders", {})
             rec = riders.setdefault(str(self.rider_id), {"name": interaction.user.name, "rides": [], "ratings": []})
@@ -185,7 +228,7 @@ class RatingView(discord.ui.View):
             })
         await save_db()
 
-        # Edit message
+        # Edit the prompt message
         msg = interaction.message
         if msg and msg.embeds:
             base = msg.embeds[0]
@@ -201,7 +244,10 @@ class RatingView(discord.ui.View):
         else:
             await interaction.response.edit_message(view=self)
 
-        # Post rating log (to rating log channel)
+        # Update the LOG embed's "Rating" field from N/A -> score
+        await self._update_log_rating_field(f"{score}/5")
+
+        # Also log to rating-log channel
         log = discord.Embed(
             title="Ride Rating Submitted",
             color=discord.Color.green(),
@@ -234,6 +280,8 @@ class ClaimView(discord.ui.View):
         self.thread_id = thread_id
         self.claimed_by: Optional[int] = None
         self._lock = asyncio.Lock()
+        # Will be set at end_ride time
+        self._log_message_id: Optional[int] = None
 
     @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, custom_id="ride_claim")
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -320,23 +368,59 @@ class ClaimView(discord.ui.View):
             new.set_footer(text="Ride ended")
             await interaction.followup.edit_message(message_id=msg.id, embed=new, view=self)
 
+        # -------- Auto LOG to RIDE_LOG_CHANNEL_ID (ping rider + driver at top) --------
+        # Try to fetch original embed details for pickup/destination/service
+        orig = msg.embeds[0] if msg and msg.embeds else None
+        pickup = destination = service = "N/A"
+        rider_mention = f"<@{self.requester_id}>"
+        if orig:
+            for f in orig.fields:
+                nm = f.name.strip().lower()
+                if nm == "pickup": pickup = f.value
+                elif nm == "destination": destination = f.value
+                elif nm == "service": service = f.value
+
+        log_embed = discord.Embed(
+            title="Ride Log",
+            description="Ride completed and logged automatically.",
+            color=discord.Color.dark_grey(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        log_embed.add_field(name="Rider", value=rider_mention, inline=True)
+        log_embed.add_field(name="Driver", value=interaction.user.mention, inline=True)
+        log_embed.add_field(name="Pickup", value=pickup, inline=True)
+        log_embed.add_field(name="Destination", value=destination, inline=True)
+        log_embed.add_field(name="Service", value=service, inline=True)
+        log_embed.add_field(name="Rating", value="N/A", inline=True)  # will be updated by RatingView
+        log_embed.set_footer(text=f"Date: {today_iso()}")
+
+        log_msg = await send_embed(
+            RIDE_LOG_CHANNEL_ID,
+            log_embed,
+            content=f"{rider_mention} {interaction.user.mention}",
+            allow_users=True
+        )
+        self._log_message_id = getattr(log_msg, "id", None)
+
+        # ---------------------------------------------------------------------------
+
         ended = discord.Embed(
             title="Ride Completed",
             description=f"Ride ended by {interaction.user.mention}.",
             color=discord.Color.dark_grey(),
             timestamp=datetime.now(timezone.utc),
         )
-        ended.add_field(name="Rider", value=f"<@{self.requester_id}>", inline=True)
+        ended.add_field(name="Rider", value=rider_mention, inline=True)
         ended.add_field(name="Driver", value=interaction.user.mention, inline=True)
         await send_embed(TARGET_CHANNEL_ID, ended)
 
         await audit(
             "Ride Ended",
-            [("Rider", f"<@{self.requester_id}>", True), ("Driver", interaction.user.mention, True)],
+            [("Rider", rider_mention, True), ("Driver", interaction.user.mention, True)],
             color=discord.Color.dark_grey()
         )
 
-        # Rating prompt in the thread (or fallback to channel)
+        # Rating prompt in the thread (or fallback to channel), wired to update the LOG
         rating_embed = discord.Embed(
             title="Rate Your Driver",
             description="How much do you rate your driver?",
@@ -344,7 +428,12 @@ class ClaimView(discord.ui.View):
             timestamp=datetime.now(timezone.utc)
         )
         rating_embed.add_field(name="\u200b", value=SEPARATOR, inline=False)
-        rating_view = RatingView(rider_id=self.requester_id, driver_id=interaction.user.id)
+        rating_view = RatingView(
+            rider_id=self.requester_id,
+            driver_id=interaction.user.id,
+            log_channel_id=RIDE_LOG_CHANNEL_ID,
+            log_message_id=self._log_message_id
+        )
 
         thread_chan = None
         if self.thread_id:
@@ -357,7 +446,7 @@ class ClaimView(discord.ui.View):
 
         if isinstance(thread_chan, discord.Thread):
             await thread_chan.send(
-                content=f"<@{self.requester_id}>",
+                content=rider_mention,
                 embed=rating_embed,
                 view=rating_view,
                 allowed_mentions=discord.AllowedMentions(users=True)
@@ -366,7 +455,7 @@ class ClaimView(discord.ui.View):
             await send_embed(
                 TARGET_CHANNEL_ID,
                 rating_embed,
-                content=f"<@{self.requester_id}>",
+                content=rider_mention,
                 allow_users=True,
                 view=rating_view
             )
@@ -403,6 +492,7 @@ async def request_ride(
     )
     e.add_field(name="Pickup", value=starting_location, inline=True)
     e.add_field(name="Destination", value=destination, inline=True)
+    e.add_field(name="Service", value=service_level.value, inline=True)
     e.add_field(name="Status", value="🟡 Unclaimed", inline=True)
     e.add_field(name="Requested By", value=interaction.user.mention, inline=False)
     e.set_thumbnail(url=interaction.user.display_avatar.url)
@@ -448,66 +538,14 @@ async def request_ride(
     )
 
 # =========================
-# /log-ride -> RIDE_LOG_CHANNEL_ID
+# /log-ride (TEMPORARILY DISABLED — kept for later)
 # =========================
-@tree.command(name="log-ride", description="Log a completed ride")
-@app_commands.describe(
-    rider="Rider user",
-    ride_link="Ride link or reference",
-    income="Income for this ride (number)",
-    rides_this_week="Number of rides you completed this week (number)",
-    comment="Optional rider comment"
-)
-async def log_ride(
-    interaction: discord.Interaction,
-    rider: discord.User,
-    ride_link: str,
-    income: str,
-    rides_this_week: str,
-    comment: Optional[str] = None
-):
-    await interaction.response.send_message("Logging ride...", ephemeral=True)
-
-    if interaction.guild_id != GUILD_ID:
-        return await interaction.edit_original_response(content="This command is not available in this server.")
-    if not has_driver_role(interaction.user):
-        return await interaction.edit_original_response(content="You are not authorized to use this command.")
-
-    income_val = safe_float(income)
-    rides_val = safe_int(rides_this_week)
-
-    async with _db_lock:
-        riders = _db.setdefault("riders", {})
-        rec = riders.setdefault(str(rider.id), {"name": rider.name, "rides": [], "ratings": []})
-        rec["name"] = rider.name
-        rec["rides"].append({
-            "date": today_iso(),
-            "driver_id": interaction.user.id,
-            "driver_name": getattr(interaction.user, "display_name", interaction.user.name),
-            "income": income_val if income_val is not None else income,
-            "rides_this_week": rides_val if rides_val is not None else rides_this_week,
-            "comment": (comment or "").strip() or None,
-            "ride_link": ride_link
-        })
-    await save_db()
-
-    emb = discord.Embed(
-        title="Ride Logged",
-        color=discord.Color.dark_grey(),
-        timestamp=datetime.now(timezone.utc)
+@tree.command(name="log-ride", description="Log a completed ride (temporarily disabled)")
+async def log_ride_disabled(interaction: discord.Interaction):
+    return await interaction.response.send_message(
+        "This command is temporarily disabled. Ride logs are now posted automatically when the driver ends a ride.",
+        ephemeral=True
     )
-    emb.add_field(name="Rider", value=rider.mention, inline=True)
-    emb.add_field(name="Driver", value=interaction.user.mention, inline=True)
-    emb.add_field(name="Ride Link", value=ride_link, inline=False)
-    emb.add_field(name="Income", value=(f"${income_val:,.2f}" if income_val is not None else income), inline=True)
-    emb.add_field(name="Rides This Week", value=(str(rides_val) if rides_val is not None else rides_this_week), inline=True)
-    emb.add_field(name="Comment", value=(comment or "-"), inline=False)
-    emb.set_thumbnail(url=rider.display_avatar.url)
-    emb.set_footer(text=f"Date: {today_iso()}")
-
-    await send_embed(RIDE_LOG_CHANNEL_ID, emb)
-    await interaction.edit_original_response(content="Ride logged successfully.")
-    await audit("Ride Logged", [("Rider", rider.mention, True), ("Driver", interaction.user.mention, True)], color=discord.Color.dark_grey())
 
 # =========================
 # ALLOCATION / PERMISSION with Approve/Deny
@@ -853,7 +891,7 @@ class IngameRideView(discord.ui.View):
 
             if isinstance(log_channel, (discord.TextChannel, discord.Thread)):
                 await log_channel.send(
-                    content=interaction.user.mention,  # PING DRIVER AT TOP
+                    content=interaction.user.mention,  # ping driver at top
                     embed=log_embed,
                     allowed_mentions=discord.AllowedMentions(roles=False, users=True, everyone=False, replied_user=False),
                 )
