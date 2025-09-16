@@ -1,1056 +1,308 @@
 # -*- coding: utf-8 -*-
-# Full bot.py — Lyft Bot (guild-scoped)
-# - /request ride  (with Claim/End; auto LOG on End; rating in thread updates LOG)
-# - /log-ride      (TEMPORARILY DISABLED — kept here)
-# - /allocation    (request, reviewers Accept/Deny)
-# - /permission    (request, reviewers Accept/Deny)
-# - /promote       (reviewers only, DM + ping, logo, white lines)
-# - /infract       (reviewers only, DM + ping, logo, white lines)
-# - /ride start    (in-game rides; End deletes if last ongoing; logs; ping driver at top)
+# main.py — /suggest command with vote buttons + auto-thread
 #
-# Environment:
-#   DISCORD_TOKEN
-#
-# Files:
-#   LYFT.png   (logo, same folder)
-#   data.json  (ratings/rides snapshot)
+# What it does
+# ------------
+# - Restricts ALL slash commands to a single guild (GUILD_ID)
+# - /suggest [suggestion] [notes]
+#     * Only users with role `CITIZEN_ROLE_ID` can use it
+#     * If the user lacks the role: ephemeral error telling them they need the Los Angeles Citizen role
+#     * Posts an orange embed in SUGGESTIONS_CHANNEL_ID
+#     * Auto-creates a thread for discussion
+#     * Adds Upvote / Downvote buttons that track unique voters
+#     * “List Voters” shows current up/down voters (ephemeral)
+# - Keeps a tiny in-memory vote store (resets on restart; easy to swap to JSON/DB if needed)
+# - Starts a tiny HTTP server (for Render health checks)
 
-import os, json, asyncio
+import os
+import asyncio
+from typing import Optional, Dict, Set
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
 
 import discord
 from discord import app_commands
-from dotenv import load_dotenv
 from aiohttp import web
+from dotenv import load_dotenv
 
 load_dotenv()
+
+# ------------- CONFIG -------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# =========================
-# CONFIG
-# =========================
 GUILD_ID = 1416057930381262880
 
-# Driver roles
-ROLE_ID_1 = 1416068902609223749
-ROLE_ID_2 = 1416063969965248594
-DRIVER_ROLES = {ROLE_ID_1, ROLE_ID_2}
+# Role gate:
+# The same role is used both as the “allowed to use /suggest” and the
+# “Los Angeles Citizen” requirement per your instruction.
+CITIZEN_ROLE_ID = 1416066285216727072
 
-# Admin reviewers (can approve/deny and use promote/infract)
-REVIEW_ROLE_1 = 1416069791495622707
-REVIEW_ROLE_2 = 1416069983942869113
+# Where suggestions are posted
+SUGGESTIONS_CHANNEL_ID = 1417470220276207636
 
-# Channels
-TARGET_CHANNEL_ID            = 1416334665958166560  # /request ride posts here
-RIDE_LOG_CHANNEL_ID          = 1416342987893375007  # auto log for /request ride on End
-RATING_LOG_CHANNEL_ID        = 1416772722981339206  # ratings log
-AUDIT_LOG_CHANNEL_ID         = 1416392593222270976  # audit
-
-ALLOCATION_CHANNEL_ID        = 1416425017406914662
-PERMISSION_CHANNEL_ID        = 1416388268894720020
-PROMOTE_CHANNEL_ID           = 1416423535550791730
-INFRACT_CHANNEL_ID           = 1416423631474655304
-
-# In-game rides
-INGAME_RIDES_CHANNEL_ID      = 1416777579905683557  # dashboards (no pings)
-INGAME_RIDE_LOG_CHANNEL_ID   = 1416342987893375007  # logs on End (ping driver at top)
-
-# Render web server
+# Web server port (for Render)
 PORT = int(os.getenv("PORT", "10000"))
-LOGO_ROUTE = "/logo.png"
-LOGO_URL: Optional[str] = None
 
-# UI bits
-SEPARATOR = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
-
-# Data file
-DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
-
-# =========================
-# BOT
-# =========================
+# ------------- BOT SETUP -------------
 intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
-# =========================
-# Lightweight JSON "DB"
-# =========================
-_db_lock = asyncio.Lock()
-_db: Dict[str, Any] = {"riders": {}}
+# In-memory vote store: { message_id: {"up": set(user_ids), "down": set(user_ids)} }
+_votes: Dict[int, Dict[str, Set[int]]] = {}
+_votes_lock = asyncio.Lock()
 
-async def load_db():
-    global _db
-    async with _db_lock:
-        if not os.path.exists(DATA_FILE):
-            _db = {"riders": {}}
-            await save_db()
-            return
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                _db = json.load(f)
-        except Exception:
-            _db = {"riders": {}}
-        _db.setdefault("riders", {})
+# ------------- HELPERS -------------
+def has_citizen_role(member: discord.abc.User) -> bool:
+    """Check if a member has the Los Angeles Citizen role."""
+    return any(getattr(r, "id", None) == CITIZEN_ROLE_ID for r in getattr(member, "roles", []))
 
-async def save_db():
-    async with _db_lock:
-        tmp = DATA_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_db, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, DATA_FILE)
+def now_utc():
+    return datetime.now(timezone.utc)
 
-# =========================
-# Utils
-# =========================
-def today_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def short_preview(text: str, maxlen: int = 40) -> str:
+    s = text.strip().replace("\n", " ")
+    return (s[: maxlen - 1] + "…") if len(s) > maxlen else s
 
-def has_driver_role(member: discord.abc.User) -> bool:
-    return any(getattr(r, "id", None) in DRIVER_ROLES for r in getattr(member, "roles", []))
+# ------------- VOTE VIEW -------------
+class SuggestionView(discord.ui.View):
+    """Upvote/Downvote/List Voters. Recreated each click so labels show current counts."""
+    def __init__(self, message_id: int, up_count: int, down_count: int):
+        super().__init__(timeout=None)
+        self.message_id = message_id
 
-def is_reviewer(member: discord.abc.User) -> bool:
-    return any(getattr(r, "id", None) in {REVIEW_ROLE_1, REVIEW_ROLE_2} for r in getattr(member, "roles", []))
+        # We set labels dynamically to show counts (e.g., "⬆ 4" / "⬇ 1")
+        # Colors mimic the screenshot (green for up, red for down, grey secondary for list).
+        self.up_button.label = f"⬆ {up_count}"
+        self.down_button.label = f"⬇ {down_count}"
 
-def safe_float(v: str) -> Optional[float]:
-    try: return float(v)
-    except: return None
+    async def _ensure_store(self):
+        async with _votes_lock:
+            _votes.setdefault(self.message_id, {"up": set(), "down": set()})
 
-def safe_int(v: str) -> Optional[int]:
-    try: return int(v)
-    except: return None
+    async def _refresh_counts(self):
+        async with _votes_lock:
+            rec = _votes.get(self.message_id) or {"up": set(), "down": set()}
+            return len(rec["up"]), len(rec["down"])
 
-async def send_embed(
-    channel_id: int,
-    embed: discord.Embed,
-    content: Optional[str] = None,
-    allow_roles=False,
-    allow_users=False,
-    view: Optional[discord.ui.View]=None
-):
-    ch = bot.get_channel(channel_id)
-    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-        try:
-            ch = await bot.fetch_channel(channel_id)  # type: ignore
-        except Exception:
-            return None
-    return await ch.send(
-        content=content or None,
-        embed=embed,
-        view=view,
-        allowed_mentions=discord.AllowedMentions(
-            roles=allow_roles, users=allow_users, everyone=False, replied_user=False
-        )
-    )
-
-async def audit(title: str, fields: List[tuple], color: discord.Color = discord.Color.blurple()):
-    emb = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
-    for name, value, inline in fields:
-        emb.add_field(name=name, value=value, inline=inline)
-    await send_embed(AUDIT_LOG_CHANNEL_ID, emb)
-
-# =========================
-# Rating UI (1..5) — updates the "Rating" field on the LOG embed
-# =========================
-class RatingView(discord.ui.View):
-    def __init__(self, rider_id: int, driver_id: int, log_channel_id: Optional[int], log_message_id: Optional[int]):
-        super().__init__(timeout=600)
-        self.rider_id = rider_id
-        self.driver_id = driver_id
-        self.log_channel_id = log_channel_id
-        self.log_message_id = log_message_id
-        self.submitted = False
-
-    async def _update_log_rating_field(self, score_str: str):
-        if not (self.log_channel_id and self.log_message_id):
-            return
-        ch = bot.get_channel(self.log_channel_id)
-        if not isinstance(ch, discord.TextChannel):
-            try:
-                ch = await bot.fetch_channel(self.log_channel_id)  # type: ignore
-            except Exception:
-                return
-        try:
-            msg = await ch.fetch_message(self.log_message_id)  # type: ignore
-        except Exception:
-            return
-        if not msg.embeds:
-            return
-        base = msg.embeds[0]
-        new = discord.Embed(
-            title=base.title,
-            description=base.description,
-            color=discord.Color.green() if score_str != "N/A" else base.color,
-            timestamp=datetime.now(timezone.utc)
-        )
-        replaced = False
-        for f in base.fields:
-            if f.name.strip().lower() == "rating":
-                new.add_field(name="Rating", value=score_str, inline=True)
-                replaced = True
+    async def _toggle_vote(self, interaction: discord.Interaction, direction: str):
+        """direction is 'up' or 'down'."""
+        await self._ensure_store()
+        uid = interaction.user.id
+        async with _votes_lock:
+            rec = _votes[self.message_id]
+            other = "down" if direction == "up" else "up"
+            # Remove from other side if present
+            rec[other].discard(uid)
+            # Toggle on/off for chosen side
+            if uid in rec[direction]:
+                rec[direction].remove(uid)
+                action = "removed"
             else:
-                new.add_field(name=f.name, value=f.value, inline=f.inline)
-        if not replaced:
-            new.add_field(name="Rating", value=score_str, inline=True)
-        if base.thumbnail and base.thumbnail.url:
-            new.set_thumbnail(url=base.thumbnail.url)
-        if base.footer and base.footer.text:
-            new.set_footer(text=base.footer.text)
+                rec[direction].add(uid)
+                action = "added"
+
+            up_count, down_count = len(rec["up"]), len(rec["down"])
+
+        # Rebuild the view with updated counts and edit message
+        self.up_button.label = f"⬆ {up_count}"
+        self.down_button.label = f"⬇ {down_count}"
         try:
-            await msg.edit(embed=new)
-        except Exception:
-            pass
-
-    async def _submit(self, interaction: discord.Interaction, score: int):
-        if interaction.user.id != self.rider_id:
-            return await interaction.response.send_message("Only the rider can submit a rating for this ride.", ephemeral=True)
-        if self.submitted:
-            return await interaction.response.send_message("You already submitted a rating. Thank you.", ephemeral=True)
-
-        self.submitted = True
-        for c in self.children:
-            c.disabled = True
-
-        # Save quick rating snapshot
-        async with _db_lock:
-            riders = _db.setdefault("riders", {})
-            rec = riders.setdefault(str(self.rider_id), {"name": interaction.user.name, "rides": [], "ratings": []})
-            rec["name"] = interaction.user.name
-            rec.setdefault("ratings", []).append({
-                "date": today_iso(),
-                "driver_id": self.driver_id,
-                "score": score
-            })
-        await save_db()
-
-        # Edit the rating prompt
-        msg = interaction.message
-        if msg and msg.embeds:
-            base = msg.embeds[0]
-            new = discord.Embed(
-                title=base.title,
-                description=f"Thanks. You rated your driver {score}/5.",
-                color=discord.Color.green(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            for f in base.fields:
-                new.add_field(name=f.name, value=f.value, inline=f.inline)
-            await interaction.response.edit_message(embed=new, view=self)
-        else:
             await interaction.response.edit_message(view=self)
+        except discord.InteractionResponded:
+            await interaction.followup.edit_message(message_id=interaction.message.id, view=self)
 
-        # Update the LOG "Rating" field
-        await self._update_log_rating_field(f"{score}/5")
+        # Quiet ephemeral confirmation
+        await interaction.followup.send(f"Vote {action}. (Up: {up_count} / Down: {down_count})", ephemeral=True)
 
-        # Also log to rating-log channel
-        log = discord.Embed(
-            title="Ride Rating Submitted",
-            color=discord.Color.green(),
-            timestamp=datetime.now(timezone.utc)
+    @discord.ui.button(
+        label="⬆ 0",
+        style=discord.ButtonStyle.success,
+        custom_id="suggest:up",
+        row=0,
+    )
+    async def up_button(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self._toggle_vote(interaction, "up")
+
+    @discord.ui.button(
+        label="⬇ 0",
+        style=discord.ButtonStyle.danger,
+        custom_id="suggest:down",
+        row=0,
+    )
+    async def down_button(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self._toggle_vote(interaction, "down")
+
+    @discord.ui.button(
+        label="List Voters",
+        style=discord.ButtonStyle.secondary,
+        custom_id="suggest:list",
+        row=0,
+    )
+    async def list_button(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self._ensure_store()
+        async with _votes_lock:
+            rec = _votes[self.message_id]
+            up_ids = list(rec["up"])
+            down_ids = list(rec["down"])
+
+        def fmt(ids):
+            return ", ".join(f"<@{i}>" for i in ids) if ids else "—"
+
+        embed = discord.Embed(
+            title="Suggestion Voters",
+            color=discord.Color.orange(),
+            timestamp=now_utc(),
         )
-        log.add_field(name="Rider", value=f"<@{self.rider_id}>", inline=True)
-        log.add_field(name="Driver", value=f"<@{self.driver_id}>", inline=True)
-        log.add_field(name="Score", value=f"{score}/5", inline=True)
-        log.add_field(name="Date", value=today_iso(), inline=True)
-        await send_embed(RATING_LOG_CHANNEL_ID, log)
+        embed.add_field(name="Upvoters", value=fmt(up_ids), inline=False)
+        embed.add_field(name="Downvoters", value=fmt(down_ids), inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary, custom_id="rate_1")
-    async def r1(self, i: discord.Interaction, _: discord.ui.Button): await self._submit(i, 1)
-    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary, custom_id="rate_2")
-    async def r2(self, i: discord.Interaction, _: discord.ui.Button): await self._submit(i, 2)
-    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, custom_id="rate_3")
-    async def r3(self, i: discord.Interaction, _: discord.ui.Button): await self._submit(i, 3)
-    @discord.ui.button(label="4", style=discord.ButtonStyle.secondary, custom_id="rate_4")
-    async def r4(self, i: discord.Interaction, _: discord.ui.Button): await self._submit(i, 4)
-    @discord.ui.button(label="5", style=discord.ButtonStyle.secondary, custom_id="rate_5")
-    async def r5(self, i: discord.Interaction, _: discord.ui.Button): await self._submit(i, 5)
+# Helper to build a fresh view from store
+async def build_view_for(message_id: int) -> SuggestionView:
+    async with _votes_lock:
+        rec = _votes.get(message_id, {"up": set(), "down": set()})
+        up, down = len(rec["up"]), len(rec["down"])
+    return SuggestionView(message_id, up, down)
 
-# =========================
-# Claim/End view for /request ride
-# =========================
-class ClaimView(discord.ui.View):
-    def __init__(self, requester_id: int, thread_id: Optional[int] = None):
-        super().__init__(timeout=None)
-        self.requester_id = requester_id
-        self.thread_id = thread_id
-        self.claimed_by: Optional[int] = None
-        self._lock = asyncio.Lock()
-        self._log_message_id: Optional[int] = None
-
-    @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, custom_id="ride_claim")
-    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        async with self._lock:
-            if not has_driver_role(interaction.user):
-                return await interaction.followup.send("You are not authorized to claim rides.", ephemeral=True)
-            if self.claimed_by is not None:
-                return await interaction.followup.send("This ride has already been claimed.", ephemeral=True)
-
-            self.claimed_by = interaction.user.id
-            button.disabled = True
-
-            msg = interaction.message
-            if msg.embeds:
-                base = msg.embeds[0]
-                new = discord.Embed(
-                    title=base.title,
-                    description=base.description,
-                    color=base.color,
-                    timestamp=datetime.now(timezone.utc),
-                )
-                for f in base.fields:
-                    nm = f.name.strip().lower()
-                    if nm in {"driver", "status"}:
-                        continue
-                    new.add_field(name=f.name, value=f.value, inline=f.inline)
-                new.add_field(name="Driver", value=interaction.user.mention, inline=True)
-                new.add_field(name="Status", value="🟢 Claimed / Ongoing", inline=True)
-                if base.thumbnail and base.thumbnail.url:
-                    new.set_thumbnail(url=base.thumbnail.url)
-                new.set_footer(text="Ride claimed")
-                await interaction.followup.edit_message(message_id=msg.id, embed=new, view=self)
-
-            assigned = discord.Embed(
-                title="Driver Assigned",
-                description=f"Your driver is {interaction.user.mention}.",
-                color=discord.Color.green(),
-                timestamp=datetime.now(timezone.utc),
-            )
-            assigned.add_field(name="Rider", value=f"<@{self.requester_id}>", inline=True)
-            assigned.add_field(name="Driver", value=interaction.user.mention, inline=True)
-            await send_embed(
-                TARGET_CHANNEL_ID,
-                assigned,
-                content=f"<@{self.requester_id}>",
-                allow_users=True
-            )
-
-            await audit(
-                "Ride Claimed",
-                [("Rider", f"<@{self.requester_id}>", True), ("Driver", interaction.user.mention, True)],
-                color=discord.Color.orange()
-            )
-
-    @discord.ui.button(label="End Ride", style=discord.ButtonStyle.danger, custom_id="ride_end")
-    async def end_ride(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        if self.claimed_by is None:
-            return await interaction.followup.send("This ride has not been claimed yet.", ephemeral=True)
-        if interaction.user.id != self.claimed_by:
-            return await interaction.followup.send("Only the driver who claimed this ride can end it.", ephemeral=True)
-
-        button.disabled = True
-
-        # Update original embed to completed
-        msg = interaction.message
-        if msg.embeds:
-            base = msg.embeds[0]
-            new = discord.Embed(
-                title=base.title,
-                description=base.description,
-                color=discord.Color.dark_grey(),
-                timestamp=datetime.now(timezone.utc),
-            )
-            status_replaced = False
-            for f in base.fields:
-                if f.name.strip().lower() == "status":
-                    new.add_field(name="Status", value="🔴 Completed", inline=True)
-                    status_replaced = True
-                else:
-                    new.add_field(name=f.name, value=f.value, inline=f.inline)
-            if not status_replaced:
-                new.add_field(name="Status", value="🔴 Completed", inline=True)
-            new.set_footer(text="Ride ended")
-            await interaction.followup.edit_message(message_id=msg.id, embed=new, view=self)
-
-        # Extract details from original embed (if present)
-        orig = msg.embeds[0] if msg and msg.embeds else None
-        pickup = destination = service = "N/A"
-        rider_mention = f"<@{self.requester_id}>"
-        if orig:
-            for f in orig.fields:
-                nm = f.name.strip().lower()
-                if nm == "pickup": pickup = f.value
-                elif nm == "destination": destination = f.value
-                elif nm == "service": service = f.value
-
-        # Auto LOG (ping DRIVER ONLY on top)
-        log_embed = discord.Embed(
-            title="Ride Log",
-            description="Ride completed and logged automatically.",
-            color=discord.Color.dark_grey(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        log_embed.add_field(name="Rider", value=rider_mention, inline=True)
-        log_embed.add_field(name="Driver", value=interaction.user.mention, inline=True)
-        log_embed.add_field(name="Pickup", value=pickup, inline=True)
-        log_embed.add_field(name="Destination", value=destination, inline=True)
-        log_embed.add_field(name="Service", value=service, inline=True)
-        log_embed.add_field(name="Rating", value="N/A", inline=True)  # updated later by RatingView
-        log_embed.set_footer(text=f"Date: {today_iso()}")
-
-        log_msg = await send_embed(
-            RIDE_LOG_CHANNEL_ID,
-            log_embed,
-            content=interaction.user.mention,  # ping driver ONLY
-            allow_users=True
-        )
-        self._log_message_id = getattr(log_msg, "id", None)
-
-        # Notify channel that ride ended
-        ended = discord.Embed(
-            title="Ride Completed",
-            description=f"Ride ended by {interaction.user.mention}.",
-            color=discord.Color.dark_grey(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        ended.add_field(name="Rider", value=rider_mention, inline=True)
-        ended.add_field(name="Driver", value=interaction.user.mention, inline=True)
-        await send_embed(TARGET_CHANNEL_ID, ended)
-
-        await audit(
-            "Ride Ended",
-            [("Rider", rider_mention, True), ("Driver", interaction.user.mention, True)],
-            color=discord.Color.dark_grey()
-        )
-
-        # Rating prompt in the thread (or fallback to channel), wired to update the LOG
-        rating_embed = discord.Embed(
-            title="Rate Your Driver",
-            description="How much do you rate your driver?",
-            color=discord.Color.blurple(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        rating_embed.add_field(name="\u200b", value=SEPARATOR, inline=False)
-        rating_view = RatingView(
-            rider_id=self.requester_id,
-            driver_id=interaction.user.id,
-            log_channel_id=RIDE_LOG_CHANNEL_ID,
-            log_message_id=self._log_message_id
-        )
-
-        thread_chan = None
-        if self.thread_id:
-            thread_chan = bot.get_channel(self.thread_id)
-            if thread_chan is None:
-                try:
-                    thread_chan = await bot.fetch_channel(self.thread_id)
-                except Exception:
-                    thread_chan = None
-
-        if isinstance(thread_chan, discord.Thread):
-            await thread_chan.send(
-                content=rider_mention,
-                embed=rating_embed,
-                view=rating_view,
-                allowed_mentions=discord.AllowedMentions(users=True)
-            )
-        else:
-            await send_embed(
-                TARGET_CHANNEL_ID,
-                rating_embed,
-                content=rider_mention,
-                allow_users=True,
-                view=rating_view
-            )
-
-# =========================
-# /request ride (Discord riders)
-# =========================
-request_group = app_commands.Group(name="request", description="Create service requests")
-
-@app_commands.choices(service_level=[
-    app_commands.Choice(name="Premium", value="Premium"),
-    app_commands.Choice(name="Standard", value="Standard"),
-])
-@request_group.command(name="ride", description="Request a ride")
+# ------------- /suggest COMMAND -------------
+@tree.command(name="suggest", description="Create a suggestion with voting buttons")
 @app_commands.describe(
-    starting_location="Pickup location",
-    destination="Destination",
-    service_level="Premium or Standard"
+    suggestion="Your suggestion",
+    notes="Optional notes or context"
 )
-async def request_ride(
+async def suggest(
     interaction: discord.Interaction,
-    starting_location: str,
-    destination: str,
-    service_level: app_commands.Choice[str]
-):
-    await interaction.response.send_message("Posting your ride...", ephemeral=True)
-
-    color = discord.Color.orange() if service_level.value == "Premium" else discord.Color.blue()
-    e = discord.Embed(
-        title=f"{service_level.value} Ride Request",
-        description=f"L y f t  R i d e  R e q u e s t\n{SEPARATOR}",
-        color=color,
-        timestamp=datetime.now(timezone.utc)
-    )
-    e.add_field(name="Pickup", value=starting_location, inline=True)
-    e.add_field(name="Destination", value=destination, inline=True)
-    e.add_field(name="Service", value=service_level.value, inline=True)
-    e.add_field(name="Status", value="🟡 Unclaimed", inline=True)
-    e.add_field(name="Requested By", value=interaction.user.mention, inline=False)
-    e.set_thumbnail(url=interaction.user.display_avatar.url)
-    e.set_footer(text="Click Claim to accept this ride")
-
-    view = ClaimView(requester_id=interaction.user.id)
-
-    ch = bot.get_channel(TARGET_CHANNEL_ID)
-    if ch is None:
-        try:
-            ch = await bot.fetch_channel(TARGET_CHANNEL_ID)
-        except discord.NotFound:
-            return await interaction.edit_original_response(content="Ride channel not found.")
-
-    msg = await ch.send(
-        content=f"<@&{ROLE_ID_1}> <@&{ROLE_ID_2}>",
-        embed=e,
-        view=view,
-        allowed_mentions=discord.AllowedMentions(roles=True)
-    )
-
-    # Create a thread for the ride
-    try:
-        t = await msg.create_thread(name=f"Ride - {interaction.user.display_name}", auto_archive_duration=1440)
-        view.thread_id = t.id
-        intro = discord.Embed(
-            title="Ride Thread",
-            description=f"{interaction.user.mention}\nUse this thread to coordinate your ride.",
-            color=discord.Color.dark_grey()
-        )
-        await t.send(embed=intro)
-    except Exception:
-        pass
-
-    await interaction.edit_original_response(content="Ride posted successfully.")
-    await audit(
-        "Ride Requested",
-        [("Rider", interaction.user.mention, True),
-         ("Pickup", starting_location, True),
-         ("Destination", destination, True),
-         ("Service", service_level.value, True)],
-        color=color
-    )
-
-# =========================
-# /log-ride (TEMP DISABLED)
-# =========================
-@tree.command(name="log-ride", description="Disabled Command, logs now get logged automatically. ")
-async def log_ride_disabled(interaction: discord.Interaction):
-    return await interaction.response.send_message(
-        "This command is temporarily disabled. Ride logs are posted automatically when the driver ends a ride.",
-        ephemeral=True
-    )
-
-# =========================
-# Approve/Deny view (Allocation/Permission)
-# =========================
-class ApproveDenyView(discord.ui.View):
-    def __init__(self, kind: str, requester_id: int):
-        super().__init__(timeout=None)
-        self.kind = kind
-        self.requester_id = requester_id
-        self.finalized = False
-
-    async def _guard(self, interaction: discord.Interaction) -> bool:
-        if not is_reviewer(interaction.user):
-            await interaction.response.send_message("You are not allowed to act on this request.", ephemeral=True)
-            return False
-        if self.finalized:
-            await interaction.response.send_message("This request has already been processed.", ephemeral=True)
-            return False
-        return True
-
-    async def _finish(self, interaction: discord.Interaction, decision: str, symbol: str, color: discord.Color):
-        self.finalized = True
-        for c in self.children: c.disabled = True
-
-        msg = interaction.message
-        if msg.embeds:
-            base = msg.embeds[0]
-            new = discord.Embed(
-                title=base.title,
-                description=base.description,
-                color=color,
-                timestamp=datetime.now(timezone.utc)
-            )
-            had_status = False
-            for f in base.fields:
-                if f.name.strip().lower() == "status":
-                    had_status = True
-                    new.add_field(name="Status", value=f"{symbol} {decision}", inline=True)
-                else:
-                    new.add_field(name=f.name, value=f.value, inline=f.inline)
-            if not had_status:
-                new.add_field(name="Status", value=f"{symbol} {decision}", inline=True)
-            try:
-                await interaction.response.edit_message(embed=new, view=self)
-            except discord.InteractionResponded:
-                await interaction.followup.edit_message(message_id=msg.id, embed=new, view=self)
-
-        dec = discord.Embed(
-            title=f"{self.kind.capitalize()} Request {decision}",
-            description=f"{self.kind.capitalize()} request was {decision.lower()} by {interaction.user.mention}.",
-            color=color,
-            timestamp=datetime.now(timezone.utc)
-        )
-        dec.add_field(name="Requester", value=f"<@{self.requester_id}>", inline=True)
-        dec.add_field(name="Reviewed By", value=interaction.user.mention, inline=True)
-        await msg.channel.send(
-            content=f"<@{self.requester_id}>",
-            embed=dec,
-            allowed_mentions=discord.AllowedMentions(users=True)
-        )
-
-        await audit(
-            f"{self.kind.capitalize()} Request {decision}",
-            [("Requester", f"<@{self.requester_id}>", True), ("Reviewed By", interaction.user.mention, True)],
-            color=color
-        )
-
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="approve_accept")
-    async def approve(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if await self._guard(interaction):
-            await self._finish(interaction, "Accepted", "🟢", discord.Color.green())
-
-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="approve_deny")
-    async def deny(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if await self._guard(interaction):
-            await self._finish(interaction, "Denied", "🔴", discord.Color.red())
-
-@tree.command(name="allocation", description="Submit an allocation request")
-@app_commands.describe(
-    role_recipient="User who will receive role changes",
-    roles_to_give="Roles to give (names/IDs, comma separated)",
-    roles_to_remove="Roles to remove (names/IDs, comma separated)",
-    proof="Proof (URL or description)"
-)
-async def allocation(
-    interaction: discord.Interaction,
-    role_recipient: discord.User,
-    roles_to_give: str,
-    roles_to_remove: str,
-    proof: str
-):
-    if interaction.guild_id != GUILD_ID:
-        return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
-    if not any(getattr(r, "id", None) == ROLE_ID_1 for r in getattr(interaction.user, "roles", [])):
-        return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
-
-    await interaction.response.send_message("Submitting allocation request...", ephemeral=True)
-
-    emb = discord.Embed(
-        title="Allocation Request",
-        description=f"{SEPARATOR}\nA driver has submitted an allocation request for review.\n{SEPARATOR}",
-        color=discord.Color.dark_teal(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    emb.add_field(name="Requested By", value=interaction.user.mention, inline=True)
-    emb.add_field(name="Recipient", value=role_recipient.mention, inline=True)
-    emb.add_field(name="Roles to Give", value=roles_to_give or "-", inline=False)
-    emb.add_field(name="Roles to Remove", value=roles_to_remove or "-", inline=False)
-    emb.add_field(name="Proof", value=proof or "-", inline=False)
-    emb.add_field(name="Status", value="🟡 Pending", inline=True)
-    emb.add_field(name="Date", value=today_iso(), inline=True)
-
-    content = f"<@&{REVIEW_ROLE_1}> <@&{REVIEW_ROLE_2}>"
-    view = ApproveDenyView(kind="allocation", requester_id=interaction.user.id)
-    await send_embed(ALLOCATION_CHANNEL_ID, emb, content=content, allow_roles=True, view=view)
-
-    await audit(
-        "Allocation Request Logged",
-        [("By", interaction.user.mention, True), ("Recipient", role_recipient.mention, True)],
-        color=discord.Color.dark_teal()
-    )
-    await interaction.followup.send("Allocation request sent.", ephemeral=True)
-
-@tree.command(name="permission", description="Submit a permission request")
-@app_commands.describe(
-    permission="Permission requested",
-    duration="Requested duration",
-    reason="Reason",
-    signed="Signature (name/ID)"
-)
-async def permission(
-    interaction: discord.Interaction,
-    permission: str,
-    duration: str,
-    reason: str,
-    signed: str
-):
-    if interaction.guild_id != GUILD_ID:
-        return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
-    if not any(getattr(r, "id", None) == ROLE_ID_1 for r in getattr(interaction.user, "roles", [])):
-        return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
-
-    await interaction.response.send_message("Submitting permission request...", ephemeral=True)
-
-    emb = discord.Embed(
-        title="Permission Request",
-        description=f"{SEPARATOR}\nA driver has submitted a permission request for approval.\n{SEPARATOR}",
-        color=discord.Color.dark_gold(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    emb.add_field(name="Requested By", value=interaction.user.mention, inline=True)
-    emb.add_field(name="Permission", value=permission or "-", inline=False)
-    emb.add_field(name="Duration", value=duration or "-", inline=True)
-    emb.add_field(name="Reason", value=reason or "-", inline=False)
-    emb.add_field(name="Signed", value=signed or "-", inline=True)
-    emb.add_field(name="Status", value="🟡 Pending", inline=True)
-    emb.add_field(name="Date", value=today_iso(), inline=True)
-
-    content = f"<@&{REVIEW_ROLE_1}> <@&{REVIEW_ROLE_2}>"
-    view = ApproveDenyView(kind="permission", requester_id=interaction.user.id)
-    await send_embed(PERMISSION_CHANNEL_ID, emb, content=content, allow_roles=True, view=view)
-
-    await audit(
-        "Permission Request Logged",
-        [("By", interaction.user.mention, True), ("Permission", permission, True), ("Duration", duration, True)],
-        color=discord.Color.dark_gold()
-    )
-    await interaction.followup.send("Permission request sent.", ephemeral=True)
-
-# =========================
-# /promote (reviewers only) — with lines + logo + DM + ping
-# =========================
-@tree.command(name="promote", description="Lyft Promotion record (reviewers only)")
-@app_commands.describe(
-    employee="User being promoted",
-    old_rank="Previous rank",
-    new_rank="New rank",
-    reason="Reason for promotion",
-    notes="Optional notes"
-)
-async def promote(
-    interaction: discord.Interaction,
-    employee: discord.User,
-    old_rank: str,
-    new_rank: str,
-    reason: str,
+    suggestion: str,
     notes: Optional[str] = None
 ):
+    # Guild lock
     if interaction.guild_id != GUILD_ID:
         return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
-    if not is_reviewer(interaction.user):
-        return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
 
-    await interaction.response.send_message("Promotion logged.", ephemeral=True)
+    # Role gate
+    if not has_citizen_role(interaction.user):
+        return await interaction.response.send_message(
+            "You need the **Los Angeles Citizen** role to use this command.",
+            ephemeral=True
+        )
 
-    desc = (
-        "Lyft Promotion Log!\n"
-        f"{SEPARATOR}\n\n"
-        f"Employee: {employee.mention}\n\n"
-        f"Old Rank: {old_rank}\n\n"
-        f"New Rank: {new_rank}\n"
-        f"{SEPARATOR}\n"
-        f"Reason: {reason}\n"
-        f"Notes: {notes or 'N/A'}\n"
-        f"{SEPARATOR}\n"
-        f"Processed by: {interaction.user.mention}"
+    await interaction.response.defer(ephemeral=True)
+
+    # Build the embed
+    embed = discord.Embed(
+        title="New Suggestion",
+        color=discord.Color.orange(),
+        timestamp=now_utc(),
     )
-    emb = discord.Embed(description=desc, color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
-    if LOGO_URL:
-        emb.set_thumbnail(url=LOGO_URL)
-
-    await send_embed(PROMOTE_CHANNEL_ID, emb, content=employee.mention, allow_users=True)
-    try:
-        await employee.send(embed=emb)
-    except discord.Forbidden:
-        await audit("Promotion DM Failed", [("Employee", employee.mention, True)], color=discord.Color.red())
-
-# =========================
-# /infract (reviewers only) — with lines + logo + DM + ping
-# =========================
-INFRACTION_CHOICES = [
-    app_commands.Choice(name="Notice", value="Notice"),
-    app_commands.Choice(name="Warning", value="Warning"),
-    app_commands.Choice(name="Strike", value="Strike"),
-    app_commands.Choice(name="Demotion", value="Demotion"),
-    app_commands.Choice(name="Suspension", value="Suspension"),
-    app_commands.Choice(name="Termination", value="Termination"),
-    app_commands.Choice(name="Blacklist", value="Blacklist"),
-]
-
-@tree.command(name="infract", description="Lyft Infraction record (reviewers only)")
-@app_commands.describe(
-    employee="User receiving infraction",
-    infraction_type="Type of infraction",
-    reason="Reason",
-    proof="Proof links or description",
-    notes="Optional notes",
-    appealable="Appealable? yes/no (optional)"
-)
-@app_commands.choices(infraction_type=INFRACTION_CHOICES)
-async def infract(
-    interaction: discord.Interaction,
-    employee: discord.User,
-    infraction_type: app_commands.Choice[str],
-    reason: str,
-    proof: Optional[str] = None,
-    notes: Optional[str] = None,
-    appealable: Optional[str] = None
-):
-    if interaction.guild_id != GUILD_ID:
-        return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
-    if not is_reviewer(interaction.user):
-        return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
-
-    await interaction.response.send_message("Infraction logged.", ephemeral=True)
-
-    appeal_display = "Yes" if (appealable or "").lower().startswith("y") else "No"
-
-    desc = (
-        "Lyft Infraction Log!\n"
-        f"{SEPARATOR}\n\n"
-        f"Officer: {interaction.user.mention}\n\n"
-        f"Reason: {reason}\n\n"
-        f"Infraction Type: {infraction_type.value}\n\n"
-        f"Appealable: {appeal_display}\n\n"
-        f"Proof: {proof or 'N/A'}\n"
-        f"Notes: {notes or 'N/A'}\n"
-        f"{SEPARATOR}\n"
-        f"Issued to: {employee.mention}"
-    )
-    emb = discord.Embed(description=desc, color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
-    if LOGO_URL:
-        emb.set_thumbnail(url=LOGO_URL)
-
-    await send_embed(INFRACT_CHANNEL_ID, emb, content=employee.mention, allow_users=True)
-    try:
-        await employee.send(embed=emb)
-    except discord.Forbidden:
-        await audit("Infraction DM Failed", [("Employee", employee.mention, True)], color=discord.Color.red())
-
-# =========================
-# /ride start (in-game) — dashboard + End Ride -> log + delete if last ongoing
-# =========================
-ongoing_message_ids: set[int] = set()
-ongoing_lock = asyncio.Lock()
-
-class IngameRideView(discord.ui.View):
-    def __init__(
-        self,
-        driver_id: int,
-        rider_name: str,
-        pickup: str,
-        destination: str,
-        username: str,
-        price_estimate: str,
-        notes: str,
-    ):
-        super().__init__(timeout=None)
-        self.driver_id = driver_id
-        self.rider_name = rider_name
-        self.pickup = pickup
-        self.destination = destination
-        self.username = username
-        self.price_estimate = price_estimate
-        self.notes = notes
-        self._lock = asyncio.Lock()
-
-    @discord.ui.button(label="End Ride", style=discord.ButtonStyle.danger, custom_id="ingame:end_ride")
-    async def end_ride(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-
-        if interaction.user.id != self.driver_id:
-            return await interaction.followup.send("Only the driver who started this in-game ride can end it.", ephemeral=True)
-
-        async with self._lock:
-            message = interaction.message
-            if message is None:
-                return
-
-            # Log the ride to INGAME_RIDE_LOG_CHANNEL_ID (ping DRIVER only)
-            log_channel = interaction.client.get_channel(INGAME_RIDE_LOG_CHANNEL_ID)
-            if log_channel is None:
-                try:
-                    log_channel = await interaction.client.fetch_channel(INGAME_RIDE_LOG_CHANNEL_ID)
-                except discord.NotFound:
-                    log_channel = None
-
-            log_embed = discord.Embed(
-                title="In-Game Ride Log",
-                color=discord.Color.dark_grey(),
-                timestamp=datetime.now(timezone.utc),
-            )
-            log_embed.add_field(name="Driver", value=interaction.user.mention, inline=True)
-            log_embed.add_field(name="Rider Name", value=self.rider_name, inline=True)
-            log_embed.add_field(name="Username", value=self.username, inline=True)
-            log_embed.add_field(name="Pick-Up", value=self.pickup, inline=False)
-            log_embed.add_field(name="Destination", value=self.destination, inline=False)
-            if self.price_estimate:
-                log_embed.add_field(name="Price Estimate", value=self.price_estimate, inline=True)
-            if self.notes:
-                log_embed.add_field(name="Notes", value=self.notes, inline=False)
-            log_embed.set_footer(text=f"Date: {today_iso()}")
-
-            if isinstance(log_channel, (discord.TextChannel, discord.Thread)):
-                await log_channel.send(
-                    content=interaction.user.mention,  # ping driver at top
-                    embed=log_embed,
-                    allowed_mentions=discord.AllowedMentions(
-                        roles=False,
-                        users=True,
-                        everyone=False,
-                        replied_user=False
-                    ),
-                )
-
-            # Track/delete behavior
-            async with ongoing_lock:
-                ongoing_message_ids.discard(message.id)
-                no_other_ongoing = len(ongoing_message_ids) == 0
-
-            if no_other_ongoing:
-                try:
-                    await message.delete()
-                except discord.HTTPException:
-                    pass
-            else:
-                button.disabled = True
-                if message.embeds:
-                    base = message.embeds[0]
-                    new = discord.Embed(
-                        title=base.title or "In-Game Ride",
-                        description=base.description or "",
-                        color=discord.Color.dark_grey(),
-                        timestamp=datetime.now(timezone.utc),
-                    )
-                    had_status = False
-                    for f in base.fields:
-                        if f.name.strip().lower() == "status":
-                            had_status = True
-                            new.add_field(name="Status", value="Completed", inline=True)
-                        else:
-                            new.add_field(name=f.name, value=f.value, inline=f.inline)
-                    if not had_status:
-                        new.add_field(name="Status", value="Completed", inline=True)
-                    if base.thumbnail and base.thumbnail.url:
-                        new.set_thumbnail(url=base.thumbnail.url)
-                    if base.footer and base.footer.text:
-                        new.set_footer(text=base.footer.text)
-                    try:
-                        await interaction.followup.edit_message(message_id=message.id, embed=new, view=self)
-                    except discord.HTTPException:
-                        pass
-
-ride_group = app_commands.Group(name="ride", description="Driver in-game ride actions")
-
-@ride_group.command(name="start", description="Start an in-game ride (for non-Discord riders)")
-@app_commands.describe(
-    rider_name="Passenger name/callsign",
-    pickup="Pick-Up location",
-    destination="Destination",
-    username="Rider's username (in-game)",
-    price_estimate="Quoted price / estimate",
-    notes="Extra info (landmarks, clothing color, etc.)",
-)
-async def ride_start(
-    interaction: discord.Interaction,
-    rider_name: str,
-    pickup: str,
-    destination: str,
-    username: str,
-    price_estimate: str = "",
-    notes: str = "",
-):
-    if interaction.guild_id != GUILD_ID:
-        return await interaction.response.send_message("This command isn't available here.", ephemeral=True)
-    if not has_driver_role(interaction.user):
-        return await interaction.response.send_message("Drivers only.", ephemeral=True)
-
-    await interaction.response.send_message("In-game ride started.", ephemeral=True)
-
-    emb = discord.Embed(
-        title="In-Game Ride",
-        description="Ride created for a rider outside Discord.",
-        color=discord.Color.teal(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    emb.add_field(name="Rider Name", value=rider_name, inline=True)
-    emb.add_field(name="Username", value=username, inline=True)
-    emb.add_field(name="Status", value="In Progress", inline=True)
-    emb.add_field(name="Pick-Up", value=pickup, inline=False)
-    emb.add_field(name="Destination", value=destination, inline=False)
-    if price_estimate:
-        emb.add_field(name="Price Estimate", value=price_estimate, inline=True)
+    embed.add_field(name="Suggestion", value=suggestion, inline=False)
     if notes:
-        emb.add_field(name="Notes", value=notes, inline=False)
-    emb.add_field(name="Driver", value=interaction.user.mention, inline=True)
-    emb.set_footer(text=f"Date: {today_iso()}")
+        embed.add_field(name="Notes", value=notes, inline=False)
+    embed.add_field(name="Submitted by", value=interaction.user.mention, inline=False)
 
-    view = IngameRideView(
-        driver_id=interaction.user.id,
-        rider_name=rider_name,
-        pickup=pickup,
-        destination=destination,
-        username=username,
-        price_estimate=price_estimate,
-        notes=notes,
-    )
-
-    channel = interaction.client.get_channel(INGAME_RIDES_CHANNEL_ID)
+    # Send to suggestions channel
+    channel = bot.get_channel(SUGGESTIONS_CHANNEL_ID)
     if channel is None:
         try:
-            channel = await interaction.client.fetch_channel(INGAME_RIDES_CHANNEL_ID)
+            channel = await bot.fetch_channel(SUGGESTIONS_CHANNEL_ID)  # type: ignore
         except discord.NotFound:
-            return
+            return await interaction.followup.send("Suggestions channel not found.", ephemeral=True)
 
-    msg = await channel.send(
-        embed=emb,
-        view=view,
-        allowed_mentions=discord.AllowedMentions(roles=False, users=False, everyone=False, replied_user=False),
-    )
+    # Prepare store and view
+    async with _votes_lock:
+        # Placeholder entry so counts start at 0
+        # (we'll replace the key after we have the message ID)
+        temp_key = -1
+        _votes[temp_key] = {"up": set(), "down": set()}
 
-    async with ongoing_lock:
-        ongoing_message_ids.add(msg.id)
+    # Send message with a temporary view (we'll rebuild right after with real message id)
+    temp_view = SuggestionView(message_id=0, up_count=0, down_count=0)
+    msg = await channel.send(embed=embed, view=temp_view)
 
-# =========================
-# Ready + Sync + Web server (serve LYFT.png)
-# =========================
+    # Swap the store key to the real message id and rebuild the view
+    async with _votes_lock:
+        rec = _votes.pop(temp_key, {"up": set(), "down": set()})
+        _votes[msg.id] = rec
+
+    real_view = await build_view_for(msg.id)
+    await msg.edit(view=real_view)
+
+    # Auto-create a thread for discussion
+    try:
+        thread_name = f"Suggestion – {short_preview(suggestion)}"
+        thread = await msg.create_thread(name=thread_name, auto_archive_duration=1440)
+        await thread.send(
+            content=interaction.user.mention,
+            embed=discord.Embed(
+                description="This thread is for discussing the suggestion above.",
+                color=discord.Color.dark_grey(),
+                timestamp=now_utc(),
+            ),
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except discord.HTTPException:
+        pass
+
+    await interaction.followup.send("Your suggestion has been posted.", ephemeral=True)
+
+# ------------- READY + VIEW REGISTRATION -------------
 @bot.event
 async def on_ready():
-    await load_db()
+    # Register a persistent view so buttons keep working after restarts.
+    # (We attach a "blank" view that will accept interactions by custom_id,
+    #  then we rebuild the real labels dynamically on each click.)
+    class _Persistent(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=None)
+
+        @discord.ui.button(label="⬆ 0", style=discord.ButtonStyle.success, custom_id="suggest:up")
+        async def _p_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+            mid = interaction.message.id
+            view = await build_view_for(mid)
+            await view.up_button.callback(interaction)  # reuse logic
+
+        @discord.ui.button(label="⬇ 0", style=discord.ButtonStyle.danger, custom_id="suggest:down")
+        async def _p_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+            mid = interaction.message.id
+            view = await build_view_for(mid)
+            await view.down_button.callback(interaction)  # reuse logic
+
+        @discord.ui.button(label="List Voters", style=discord.ButtonStyle.secondary, custom_id="suggest:list")
+        async def _p_list(self, interaction: discord.Interaction, button: discord.ui.Button):
+            mid = interaction.message.id
+            view = await build_view_for(mid)
+            await view.list_button.callback(interaction)  # reuse logic
+
+    bot.add_view(_Persistent())
+
+    # Guild-only sync
     guild = discord.Object(id=GUILD_ID)
-    tree.add_command(request_group, guild=guild)
-    tree.add_command(ride_group, guild=guild)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
     print(f"Logged in as {bot.user} (ID: {bot.user.id}) — commands synced")
 
-async def handle_logo(_):
-    filepath = os.path.join(os.path.dirname(__file__), "LYFT.png")
-    return web.FileResponse(filepath) if os.path.exists(filepath) else web.Response(status=404)
-
+# ------------- TINY HTTP SERVER (for Render) -------------
 async def handle_health(_):
     return web.Response(text="OK")
 
 async def start_web_server():
-    global LOGO_URL
     app = web.Application()
-    app.router.add_get(LOGO_ROUTE, handle_logo)
     app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    host = os.getenv("RENDER_EXTERNAL_URL")
-    if host:
-        if not host.startswith("http"):
-            host = "https://" + host
-        LOGO_URL = host.rstrip("/") + LOGO_ROUTE
-    else:
-        LOGO_URL = f"http://localhost:{PORT}{LOGO_ROUTE}"
-    print(f"HTTP server listening on 0.0.0.0:{PORT} | LOGO_URL={LOGO_URL}")
+    print(f"HTTP server listening on 0.0.0.0:{PORT}")
 
-# =========================
-# MAIN
-# =========================
+# ------------- MAIN -------------
 async def main():
     if not TOKEN:
-        raise RuntimeError("Missing DISCORD_TOKEN")
+        raise RuntimeError("Please set DISCORD_TOKEN in your environment.")
     await start_web_server()
     await bot.start(TOKEN)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
