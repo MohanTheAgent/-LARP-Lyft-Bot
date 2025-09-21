@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# FULL main.py — Lyft RP Bot
+# FULL main.py — Lyft RP Bot (with /blacklist added)
 #
-# Features
+# Features kept intact:
 # - Guild restricted (GUILD_ID)
 # - /request ride  -> posts request, pings driver roles, creates thread, Claim / End buttons
 #       * On End: posts Ride Log in RIDE_LOG_CHANNEL_ID (PING DRIVER ONLY)
@@ -12,13 +12,8 @@
 # - /promote and /infract -> reviewer-only, orange/red embeds with logo thumbnail, white separators, DM the target + ping on top
 # - /log-ride -> TEMP DISABLED (kept as stub)
 # - /suggest -> citizen-only suggestions with Up/Down/List Voters buttons and auto thread
+# - NEW: /blacklist -> posts a blacklist announcement embed to BLACKLIST_CHANNEL_ID (role-gated)
 # - Tiny HTTP server for Render health + serving LYFT.png as thumbnail
-#
-# Environment:
-#   DISCORD_TOKEN
-#
-# Files (same folder):
-#   LYFT.png (logo)
 
 import os, json, asyncio
 from datetime import datetime, timezone
@@ -62,6 +57,10 @@ INGAME_RIDES_CHANNEL_ID       = 1416777579905683557  # in-game dashboards
 INGAME_RIDE_LOG_CHANNEL_ID    = 1416342987893375007  # in-game logs
 
 SUGGESTIONS_CHANNEL_ID        = 1417470220276207636  # /suggest
+
+# Blacklist
+BLACKLIST_CHANNEL_ID          = 1419171827435049053
+BLACKLISTER_ROLE_ID           = 1416069983942869113  # only this role can use /blacklist
 
 # Render web server
 PORT = int(os.getenv("PORT", "10000"))
@@ -174,11 +173,10 @@ class RatingView(discord.ui.View):
         self.submitted = True
         for c in self.children: c.disabled = True
 
-        # Edit prompt
         base = interaction.message.embeds[0] if interaction.message and interaction.message.embeds else None
         new = discord.Embed(
             title="Thanks for your feedback!",
-            description=f"You rated your driver **{score}/5**.",
+            description=f"You rated your driver {score}/5.",
             color=discord.Color.green(), timestamp=now_utc()
         )
         if base:
@@ -186,7 +184,6 @@ class RatingView(discord.ui.View):
                 new.add_field(name=f.name, value=f.value, inline=f.inline)
         await interaction.response.edit_message(embed=new, view=self)
 
-        # Update ride LOG and rating audit
         await self._update_log_rating(f"{score}/5")
         log = discord.Embed(title="Ride Rating Submitted", color=discord.Color.green(), timestamp=now_utc())
         log.add_field(name="Rider", value=f"<@{self.rider_id}>", inline=True)
@@ -289,7 +286,6 @@ class ClaimView(discord.ui.View):
             new.set_footer(text="Ride ended")
             await interaction.followup.edit_message(message_id=msg.id, embed=new, view=self)
 
-        # Extract for log
         orig = msg.embeds[0] if msg and msg.embeds else None
         pickup = destination = service = "N/A"
         rider_mention = f"<@{self.requester_id}>"
@@ -300,7 +296,6 @@ class ClaimView(discord.ui.View):
                 elif nm == "destination": destination = f.value
                 elif nm == "service": service = f.value
 
-        # Auto ride log (PING DRIVER ONLY)
         log_embed = discord.Embed(
             title="Ride Log",
             description="Ride completed and logged automatically.",
@@ -335,7 +330,6 @@ class ClaimView(discord.ui.View):
                      ("Driver", interaction.user.mention, True)],
                     color=discord.Color.dark_grey())
 
-        # Post rating prompt in the ride thread (fallback to channel)
         rating_embed = discord.Embed(
             title="Rate Your Driver",
             description="How much do you rate your driver?",
@@ -408,7 +402,6 @@ async def request_ride(
         allowed_mentions=discord.AllowedMentions(roles=True)
     )
 
-    # Create thread
     try:
         t = await msg.create_thread(name=f"Ride - {interaction.user.display_name}", auto_archive_duration=1440)
         view.thread_id = t.id
@@ -717,7 +710,6 @@ class IngameRideView(discord.ui.View):
             if message is None:
                 return
 
-            # Log (PING DRIVER ONLY)
             log_channel = interaction.client.get_channel(INGAME_RIDE_LOG_CHANNEL_ID) or await interaction.client.fetch_channel(INGAME_RIDE_LOG_CHANNEL_ID)
             log_embed = discord.Embed(title="In-Game Ride Log", color=discord.Color.dark_grey(), timestamp=now_utc())
             log_embed.add_field(name="Driver", value=interaction.user.mention, inline=True)
@@ -738,7 +730,6 @@ class IngameRideView(discord.ui.View):
                     allowed_mentions=discord.AllowedMentions(roles=False, users=True, everyone=False, replied_user=False)
                 )
 
-            # Track/delete
             async with ongoing_lock:
                 ongoing_message_ids.discard(message.id)
                 no_other_ongoing = len(ongoing_message_ids) == 0
@@ -906,7 +897,7 @@ async def suggest(interaction: discord.Interaction, suggestion: str, notes: Opti
     if interaction.guild_id != GUILD_ID:
         return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
     if not has_citizen_role(interaction.user):
-        return await interaction.response.send_message("You need the **Los Angeles Citizen** role to use this command.", ephemeral=True)
+        return await interaction.response.send_message("You need the Los Angeles Citizen role to use this command.", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
     e = discord.Embed(title="New Suggestion", color=discord.Color.orange(), timestamp=now_utc())
@@ -934,10 +925,55 @@ async def suggest(interaction: discord.Interaction, suggestion: str, notes: Opti
 
     await interaction.followup.send("Your suggestion has been posted.", ephemeral=True)
 
+# ------------------- /blacklist -------------------
+@tree.command(name="blacklist", description="Post a Lyft Blacklist announcement.")
+@app_commands.describe(
+    citizen="Person being blacklisted (type a name; not a member picker)",
+    blacklist="Select the blacklist (Lyft Blacklist)",
+    reason="Reason for blacklist",
+    duration="e.g., Permanent, or 2025-01-01 to 2025-03-01"
+)
+@app_commands.choices(
+    blacklist=[app_commands.Choice(name="Lyft Blacklist", value="Lyft Blacklist")]
+)
+async def blacklist(
+    interaction: discord.Interaction,
+    citizen: str,
+    blacklist: app_commands.Choice[str],
+    reason: str,
+    duration: str
+):
+    if interaction.guild_id != GUILD_ID:
+        return await interaction.response.send_message("This command is not available in this server.", ephemeral=True)
+    if not any(getattr(r, "id", None) == BLACKLISTER_ROLE_ID for r in getattr(interaction.user, "roles", [])):
+        return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    title = "<:Lyft:1416424004092428370> Lyft Blacklist Announcement <:Lyft:1416424004092428370>"
+    desc_lines = [
+        f"**Citizen:** {citizen}",
+        "",
+        f"**Blacklist:** {blacklist.value}",
+        "",
+        f"**Reason:** {reason}",
+        "",
+        f"**Duration:** `{duration}`",
+        "",
+        f"**Signed:** {interaction.user.mention}",
+    ]
+    emb = discord.Embed(
+        title=title,
+        description="\n".join(desc_lines),
+        color=discord.Color.red(),
+        timestamp=now_utc(),
+    )
+    await send_embed(BLACKLIST_CHANNEL_ID, emb)
+    await interaction.followup.send("Blacklist announcement posted.", ephemeral=True)
+
 # ------------------- READY + SYNC + PERSISTENT ROUTERS -------------------
 @bot.event
 async def on_ready():
-    # Persistent router for suggestion buttons (so they work after restarts)
     class _SuggestRouter(discord.ui.View):
         def __init__(self): super().__init__(timeout=None)
         @discord.ui.button(label="⬆ 0", style=discord.ButtonStyle.success, custom_id="suggest:up")
